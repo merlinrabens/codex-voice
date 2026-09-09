@@ -1,5 +1,7 @@
 # Codex Voice
 
+Built for Intel Mac users who cannot use the ChatGPT desktop app and want live voice with Codex. You run Codex CLI locally and talk through your browser. The desktop app is not required.
+
 An experimental, unofficial local voice interface for Codex CLI. Talk while Codex works, send text to steer a task, and review supported approval requests in your browser.
 
 Codex Voice starts your installed `codex app-server` and uses its experimental Realtime connection with your existing ChatGPT login. Task execution defaults to `gpt-6-astra`; OpenAI's voice channel is a separate model. This project does not bundle OpenAI software, credentials, a voice model, or a Computer Use runtime.
