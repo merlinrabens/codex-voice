@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="referrer" content="no-referrer">
+  <title>Codex Voice · Verbinden</title>
+  <link rel="stylesheet" href="/pair.css">
+  <script src="/pair.js" defer></script>
+</head>
+<body>
+  <main>
+    <div class="brand"><span>✳</span> Codex Voice</div>
+    <p class="eyebrow">DEIN MAC. DEINE STIMME.</p>
+    <h1>Von hier aus<br>weiterdenken.</h1>
+    <p>Verbinde dieses Gerät einmal mit deiner laufenden Voice-Sitzung. Danach kannst du direkt lossprechen.</p>
+    <form id="pair-form">
+      <label for="pair-code">Kopplungscode</label>
+      <input id="pair-code" type="password" autocomplete="off" autocapitalize="none" spellcheck="false" required maxlength="128">
+      <button id="pair-submit" type="submit">Mit meinem Mac verbinden <span>↗</span></button>
+      <p id="pair-status" role="status" aria-live="polite"></p>
+    </form>
+    <p class="footnote">Der Code aus deinem persönlichen Link ist einmal verwendbar und 30 Minuten gültig. Mikrofonzugriff kommt erst beim Start des Gesprächs.</p>
+  </main>
+</body>
+</html>

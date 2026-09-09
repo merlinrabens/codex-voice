@@ -2,7 +2,7 @@
 <html lang="de">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="color-scheme" content="dark">
   <title>Astra · Sprache</title>
   <link rel="stylesheet" href="/style.css">
@@ -38,7 +38,10 @@
             <button id="stop-voice" class="button secondary" type="button">Beenden</button>
           </div>
           <button id="enable-audio" class="button text-button full-width" type="button" hidden>Ton aktivieren</button>
+          <p id="wake-status" class="wake-status" hidden>Bildschirm bleibt während des Gesprächs an.</p>
+          <p id="memory-status" class="memory-status" role="status" hidden></p>
           <p class="privacy-note">Astra arbeitet über Codex.<br>Mikrofon startet erst per Klick.</p>
+          <p class="mobile-note">Auf dem iPhone diese Seite im Vordergrund lassen. Beim Sperren oder Appwechsel kann Safari die Sprache pausieren.</p>
           <p class="capability-note">Computer Use: nur mit OpenAIs nativem Dienst.</p>
         </div>
 
@@ -84,6 +87,7 @@
         </div>
 
         <div id="notice" class="notice" role="alert" hidden><span id="notice-text"></span><button id="dismiss-notice" type="button" aria-label="Hinweis schließen">×</button></div>
+        <button id="login-again" class="button secondary login-again" type="button" hidden>Gerät erneut anmelden</button>
 
         <div id="conversation" class="conversation" role="log" aria-label="Gesprächsverlauf" aria-live="polite" aria-relevant="additions">
           <div id="empty-state" class="empty-state">
@@ -103,13 +107,13 @@
             <textarea id="message" rows="1" placeholder="Oder schreib Astra etwas …" maxlength="30000"></textarea>
             <button id="send-text" type="submit" aria-label="Nachricht senden" title="Nachricht senden"><span aria-hidden="true">↑</span></button>
           </form>
-          <div class="composer-footer"><span id="connection-status"><span class="connection-dot"></span> Verbinde lokal …</span><span>Enter senden · ⇧ Enter Absatz</span></div>
+          <div class="composer-footer"><span id="connection-status" role="status"><span class="connection-dot"></span> Verbinde mit Codex …</span><span>Enter senden · ⇧ Enter Absatz</span></div>
         </div>
       </section>
     </div>
 
     <footer class="page-footer"><span>Auf deinem Rechner · verbundene Modelle verarbeiten deine Eingaben</span><span id="session-footer">CODEX VOICE</span></footer>
   </main>
-  <audio id="remote-audio" autoplay hidden></audio>
+  <audio id="remote-audio" autoplay playsinline hidden></audio>
 </body>
 </html>

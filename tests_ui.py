@@ -11,13 +11,28 @@ from pathlib import Path
 import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
 
 from playwright.sync_api import expect, sync_playwright
 
 
 ROOT = Path(__file__).resolve().parent
 BOOT = r"""
-window.uiFixture = {micCalls:0, contexts:[], tracks:[], peers:[], storageWrites:[], speakerConnections:0};
+window.uiFixture = {micCalls:0, contexts:[], inputContexts:[], tracks:[], peers:[], channels:[], storageWrites:[], speakerConnections:0, audioPlays:[], actions:[], wakeLocks:[], visibility:'visible'};
+const nativeFetch = window.fetch;
+window.fetch = (...args) => { uiFixture.actions.push(String(args[0])); return nativeFetch(...args); };
+const nativePlay = HTMLMediaElement.prototype.play;
+HTMLMediaElement.prototype.play = function() {
+  uiFixture.actions.push('audio.play');
+  uiFixture.audioPlays.push({gesture:navigator.userActivation.isActive, source:this.src});
+  return nativePlay.call(this);
+};
+Object.defineProperty(document, 'visibilityState', {get:() => uiFixture.visibility});
+Object.defineProperty(navigator, 'wakeLock', {value:{request:async () => {
+  const lock = new EventTarget(); lock.released = false;
+  lock.release = async () => { lock.released = true; lock.dispatchEvent(new Event('release')); };
+  uiFixture.wakeLocks.push(lock); return lock;
+}}});
 const nativeConnect = AudioNode.prototype.connect;
 AudioNode.prototype.connect = function(destination, ...rest) {
   if (destination instanceof AudioDestinationNode) uiFixture.speakerConnections++;
@@ -25,7 +40,7 @@ AudioNode.prototype.connect = function(destination, ...rest) {
 };
 const RealAudioContext = window.AudioContext;
 window.AudioContext = class extends RealAudioContext {
-  constructor(...args) { super(...args); uiFixture.contexts.push(this); }
+  constructor(...args) { super(...args); uiFixture.contexts.push(this); uiFixture.actions.push('AudioContext'); }
 };
 const nativeSetItem = Storage.prototype.setItem;
 Storage.prototype.setItem = function(key, value) {
@@ -35,6 +50,7 @@ Storage.prototype.setItem = function(key, value) {
 Object.defineProperty(navigator.mediaDevices, 'getUserMedia', {value: async () => {
   uiFixture.micCalls++;
   const context = new AudioContext();
+  uiFixture.inputContexts.push(context);
   const oscillator = context.createOscillator();
   const gain = context.createGain();
   const destination = context.createMediaStreamDestination();
@@ -50,7 +66,11 @@ Object.defineProperty(navigator.mediaDevices, 'getUserMedia', {value: async () =
 window.RTCPeerConnection = class {
   constructor() { this.connectionState = 'new'; uiFixture.peers.push(this); }
   addTrack() {}
-  createDataChannel() { return {addEventListener() {}, close() {}, readyState:'open'}; }
+  createDataChannel() {
+    const channel = new EventTarget(); channel.readyState = 'open';
+    channel.close = () => { channel.readyState = 'closed'; };
+    uiFixture.channels.push(channel); return channel;
+  }
   async createOffer() { return {type:'offer',sdp:'v=0 ui-test'}; }
   async setLocalDescription(value) { this.localDescription = value; }
   async setRemoteDescription() { this.connectionState = 'connected'; this.onconnectionstatechange?.(); }
@@ -68,13 +88,19 @@ class FixtureServer(ThreadingHTTPServer):
         self.events = []
         self.requests = []
         self.running = True
+        self.expired = False
+        self.poll_requests = []
+        self.poll_duplicate = None
+        self.sse_requests = 0
+        self.memory_failures = 0
+        self.memory_records = []
         self.state = {'threadId': None, 'cwd': cwd, 'model': 'gpt-6-astra',
                       'effort': 'high', 'permissionMode': 'ask', 'voiceActive': False,
                       'activeTurnId': None}
 
     def emit(self, method, params):
         with self.condition:
-            self.events.append({'method': method, 'params': params})
+            self.events.append({'id': len(self.events) + 1, 'method': method, 'params': params})
             self.condition.notify_all()
 
 
@@ -90,19 +116,40 @@ class FixtureHandler(BaseHTTPRequestHandler):
         except ConnectionResetError:
             pass  # The isolated browser may close an idle keep-alive socket.
 
-    def respond(self, body, kind='application/json'):
+    def respond(self, body, kind='application/json', status=200):
         if not isinstance(body, bytes):
             body = json.dumps(body).encode()
-        self.send_response(200)
+        self.send_response(status)
         self.send_header('Content-Type', kind)
         self.send_header('Content-Length', str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
     def do_GET(self):
+        if self.path.startswith('/api/') and self.server.expired:
+            return self.respond({'error': 'Pairing expired'}, status=401)
         if self.path == '/api/state':
             return self.respond(dict(self.server.state))
+        if self.path.startswith('/api/events/poll?'):
+            query = parse_qs(urlparse(self.path).query)
+            after = int(query['after'][0])
+            self.server.poll_requests.append(after)
+            with self.server.condition:
+                self.server.condition.wait_for(lambda: len(self.server.events) > after or not self.server.running or self.server.expired, .25)
+                pending = self.server.events[after:]
+                duplicate = self.server.poll_duplicate
+                self.server.poll_duplicate = None
+                cursor = len(self.server.events)
+            if self.server.expired:
+                return self.respond({'error': 'Pairing expired'}, status=401)
+            if duplicate:
+                pending = [duplicate] + pending
+            try:
+                return self.respond({'events': pending, 'cursor': cursor, 'state': dict(self.server.state)})
+            except (BrokenPipeError, ConnectionResetError):
+                return
         if self.path == '/api/events':
+            self.server.sse_requests += 1
             self.send_response(200)
             self.send_header('Content-Type', 'text/event-stream')
             self.send_header('Cache-Control', 'no-cache')
@@ -137,7 +184,15 @@ class FixtureHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         data = json.loads(self.rfile.read(int(self.headers.get('Content-Length', '0'))))
         self.server.requests.append((self.path, data))
-        if self.path == '/api/session':
+        if self.path == '/api/memory/transcript':
+            with self.server.condition:
+                if self.server.memory_failures:
+                    self.server.memory_failures -= 1
+                    return self.respond({'error': 'Temporary archive outage'}, status=503)
+                self.server.memory_records.append(data)
+                self.server.condition.notify_all()
+            return self.respond({'saved': True})
+        elif self.path == '/api/session':
             self.server.state.update(data, threadId=f'ui-thread-{len(self.server.requests)}')
             self.server.emit('state', dict(self.server.state))
         elif self.path == '/api/voice/start':
@@ -255,7 +310,7 @@ def run():
                     page.set_viewport_size({'width': 1380, 'height': 1080})
                 page.get_by_role('button', name='Mikro aus', exact=True).click()
                 expect(page.locator('#voice-control')).to_have_attribute('data-meter', 'idle')
-                page.wait_for_function("uiFixture.contexts[1].state === 'closed'")
+                page.wait_for_function("uiFixture.contexts.filter(context => !uiFixture.inputContexts.includes(context)).every(context => context.state === 'closed')")
                 assert page.evaluate('uiFixture.tracks[0].enabled') is False
                 page.get_by_role('button', name='Mikro an', exact=True).click()
                 expect(page.locator('#voice-control')).to_have_attribute('data-meter', 'active')
@@ -264,7 +319,7 @@ def run():
                 page.wait_for_function("Number(document.getElementById('voice-control').style.getPropertyValue('--mic-level')) < .01")
                 page.get_by_role('button', name='Beenden', exact=True).click()
                 expect(page.get_by_role('button', name='Gespräch starten')).to_be_enabled()
-                page.wait_for_function("uiFixture.contexts.slice(1).every(context => context.state === 'closed')")
+                page.wait_for_function("uiFixture.contexts.filter(context => !uiFixture.inputContexts.includes(context)).every(context => context.state === 'closed')")
                 assert page.evaluate("uiFixture.tracks.every(track => track.readyState === 'ended')")
                 assert page.evaluate("uiFixture.peers.every(peer => peer.connectionState === 'closed')")
                 report.append('real RMS reacts to synthetic audio and silence without speaker routing; mute and stop clean up')
@@ -283,6 +338,131 @@ def run():
                 assert page.evaluate("uiFixture.peers.every(peer => peer.connectionState === 'closed')")
                 assert page.evaluate('uiFixture.speakerConnections') == 0
                 report.append('reduced motion skips analyser; pagehide closes own audio')
+                assert not errors, errors
+                context.close()
+
+                with server.condition:
+                    server.events.clear()
+                    server.state.update(threadId=None, voiceActive=False, activeTurnId=None, permissionMode='ask', clientTransport='poll')
+                remote_context = browser.new_context(viewport={'width': 390, 'height': 844}, is_mobile=True, has_touch=True)
+                remote = remote_context.new_page()
+                remote.on('pageerror', lambda error: errors.append(str(error)))
+                sse_before = server.sse_requests
+                remote.goto(url)
+                expect(remote.locator('#connection-status')).to_contain_text('Mit deinem Mac verbunden')
+                assert server.sse_requests == sse_before
+                assert remote.evaluate('uiFixture.micCalls') == 0
+                assert remote.locator('#remote-audio').get_attribute('playsinline') == ''
+                expect(remote.locator('.mobile-note')).to_be_visible()
+                assert remote.locator('#message').evaluate("element => getComputedStyle(element).fontSize") == '16px'
+                assert remote.evaluate('document.documentElement.scrollWidth <= innerWidth')
+                remote.get_by_role('button', name='Gespräch starten').click()
+                expect(remote.locator('#voice-control')).to_have_attribute('data-phase', 'connected')
+                expect(remote.locator('#wake-status')).to_be_visible()
+                assert remote.evaluate("uiFixture.audioPlays[0].gesture && uiFixture.audioPlays[0].source.startsWith('blob:')")
+                assert remote.evaluate("uiFixture.actions.indexOf('audio.play') < uiFixture.actions.indexOf('/api/session')")
+                assert remote.evaluate("uiFixture.actions.indexOf('AudioContext') < uiFixture.actions.indexOf('/api/session')")
+                if screenshot_dir:
+                    remote.screenshot(path=str(destination / 'voice-remote-mobile.png'), full_page=True)
+
+                def speech_event(payload):
+                    remote.evaluate("payload => uiFixture.channels.at(-1).dispatchEvent(new MessageEvent('message', {data:JSON.stringify(payload)}))", payload)
+
+                server.state.update(memoryEnabled=True, memoryServerTranscripts=True, memoryStatus='saving')
+                server.emit('state', dict(server.state))
+                expect(remote.locator('#memory-status')).to_have_text('Gespräch wird gespeichert …')
+                server.emit('thread/realtime/transcript/done', {'role': 'user', 'text': 'Serverseitig gespeicherter Satz.'})
+                speech_event({'type': 'conversation.item.input_audio_transcription.completed', 'item_id': 'server-owned', 'transcript': 'Serverseitig gespeicherter Satz.'})
+                assert not [request for request in server.requests if request[0] == '/api/memory/transcript']
+                server.state.update(memoryStatus='saved')
+                server.emit('state', dict(server.state))
+                expect(remote.locator('#memory-status')).to_have_text('Gesprächsprotokoll gespeichert.')
+                server.state.update(memoryServerTranscripts=False, memoryStatus='ready')
+                server.emit('state', dict(server.state))
+                expect(remote.locator('#memory-status')).to_have_text('Gesprächsprotokoll aktiv.')
+                server.memory_failures = 1
+                speech_event({'type': 'conversation.item.input_audio_transcription.completed', 'item_id': 'spoken-user-1', 'transcript': 'Bitte bewahre diese Entscheidung auf.'})
+                expect(remote.locator('#memory-status')).to_contain_text('erneut versucht')
+                speech_event({'type': 'response.output_audio_transcript.delta', 'item_id': 'spoken-assistant-1', 'delta': 'Unfertig'})
+                speech_event({'type': 'response.output_audio_transcript.done', 'item_id': 'spoken-assistant-1', 'transcript': 'Die Entscheidung ist vermerkt.'})
+                speech_event({'type': 'response.done', 'response': {'id': 'response-1', 'output': [{'id': 'spoken-assistant-1', 'role': 'assistant', 'content': [{'type': 'audio', 'transcript': 'Die Entscheidung ist vermerkt.'}]}]}})
+                with server.condition:
+                    assert server.condition.wait_for(lambda: len(server.memory_records) == 2, 6)
+                assert {record['itemId'] for record in server.memory_records} == {'spoken-user-1', 'spoken-assistant-1'}
+                assert all(record['threadId'] == server.state['threadId'] for record in server.memory_records)
+                assert all(record['text'] != 'Unfertig' for record in server.memory_records)
+                assert remote.evaluate('uiFixture.storageWrites.length') == 0
+                report.append('server transcript ownership avoids duplicates; final speech fallback retries with stable IDs and ignores interim text')
+                server.emit('thread/realtime/transcript/delta', {'role': 'assistant', 'delta': 'Hallo '})
+                expect(remote.locator('.message-content').filter(has_text='Hallo ')).to_have_count(1)
+                with server.condition:
+                    server.poll_duplicate = server.events[-1]
+                server.emit('thread/realtime/transcript/delta', {'role': 'assistant', 'delta': 'Welt'})
+                expect(remote.locator('.message-content').filter(has_text='Hallo Welt')).to_have_count(1)
+                assert 'Hallo Hallo' not in remote.locator('#conversation').inner_text()
+                approval(90, {'command': 'git status', 'availableDecisions': ['accept', 'decline']})
+                expect(remote.locator('.approval-card pre')).to_have_text('git status')
+                remote.get_by_role('button', name='Einmal erlauben', exact=True).click()
+                expect(remote.locator('.approval-card')).to_have_count(0)
+                assert server.poll_requests == sorted(server.poll_requests)
+                report.append('remote polling uses monotonic cursor, ignores duplicates, renders transcripts and approvals without SSE')
+
+                remote.evaluate("uiFixture.visibility='hidden'; document.dispatchEvent(new Event('visibilitychange'))")
+                expect(remote.locator('#voice-control')).to_have_attribute('data-phase', 'background')
+                expect(remote.locator('#wake-status')).to_be_hidden()
+                assert remote.evaluate('uiFixture.wakeLocks.every(lock => lock.released)')
+                remote.evaluate("uiFixture.visibility='visible'; document.dispatchEvent(new Event('visibilitychange'))")
+                expect(remote.locator('#voice-control')).to_have_attribute('data-phase', 'connected')
+                expect(remote.locator('#wake-status')).to_be_visible()
+                assert remote.evaluate('uiFixture.micCalls') == 1
+                remote.evaluate("uiFixture.tracks[0].dispatchEvent(new Event('mute'))")
+                expect(remote.locator('#voice-control')).to_have_attribute('data-phase', 'error')
+                expect(remote.get_by_role('button', name='Gespräch starten')).to_be_enabled()
+                assert remote.evaluate('uiFixture.tracks.every(track => track.readyState === "ended")')
+                remote.get_by_role('button', name='Gespräch starten').click()
+                expect(remote.locator('#voice-control')).to_have_attribute('data-phase', 'connected')
+                report.append('audio play and context unlock precede async session creation; wake lock release/reacquire and interrupted microphone restart')
+
+                server.memory_failures = 1
+                speech_event({'type': 'conversation.item.input_audio_transcription.completed', 'item_id': 'pagehide-last-sentence', 'transcript': 'Der letzte Satz bleibt erhalten.'})
+                expect(remote.locator('#memory-status')).to_contain_text('erneut versucht')
+                remote.evaluate("window.dispatchEvent(new Event('pagehide'))")
+                expect(remote.locator('#voice-control')).to_have_attribute('data-phase', 'error')
+                assert remote.evaluate('uiFixture.tracks.every(track => track.readyState === "ended")')
+                polls_at_hide = remote.evaluate("uiFixture.actions.filter(action => action.startsWith('/api/events/poll?')).length")
+                remote.wait_for_timeout(450)
+                assert remote.evaluate("uiFixture.actions.filter(action => action.startsWith('/api/events/poll?')).length") == polls_at_hide
+                with server.condition:
+                    assert server.condition.wait_for(lambda: any(record['itemId'] == 'pagehide-last-sentence' for record in server.memory_records), 3)
+                remote.evaluate("window.dispatchEvent(new PageTransitionEvent('pageshow', {persisted:true}))")
+                expect(remote.get_by_role('button', name='Gespräch starten')).to_be_enabled()
+                remote.get_by_role('button', name='Gespräch starten').click()
+                expect(remote.locator('#voice-control')).to_have_attribute('data-phase', 'connected')
+                report.append('pagehide aborts remote polling and media; browser history restore reconnects events without reopening microphone')
+
+                with server.condition:
+                    server.expired = True
+                    server.condition.notify_all()
+                expect(remote.get_by_role('button', name='Gerät erneut anmelden')).to_be_visible()
+                expect(remote.locator('#connection-status')).to_contain_text('Anmeldung abgelaufen')
+                expect(remote.get_by_role('button', name='Gespräch starten')).to_be_disabled()
+                assert remote.evaluate('uiFixture.tracks.every(track => track.readyState === "ended")')
+                assert remote.evaluate('uiFixture.peers.every(peer => peer.connectionState === "closed")')
+                assert remote.evaluate('uiFixture.wakeLocks.every(lock => lock.released)')
+                remote_context.close()
+                server.expired = False
+                server.state['voiceActive'] = False
+                insecure_context = browser.new_context()
+                insecure_context.add_init_script("Object.defineProperty(window, 'isSecureContext', {value:false})")
+                insecure = insecure_context.new_page()
+                insecure.goto(url)
+                expect(insecure.locator('#connection-status')).to_contain_text('Mit deinem Mac verbunden')
+                insecure.get_by_role('button', name='Gespräch starten').click()
+                expect(insecure.locator('#notice-text')).to_contain_text('HTTPS-Link')
+                assert insecure.evaluate('uiFixture.micCalls') == 0
+                assert insecure.evaluate('uiFixture.audioPlays.length') == 0
+                insecure_context.close()
+                report.append('expired pairing stops local media and asks to sign in; insecure context explains HTTPS before microphone access')
                 assert not errors, errors
                 browser.close()
                 print(json.dumps({'result': 'passed', 'checks': report, 'javascript_errors': errors,

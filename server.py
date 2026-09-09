@@ -2,14 +2,22 @@
 """Local WebRTC voice frontend for Codex's experimental app-server."""
 import argparse
 import collections
+import hashlib
+import hmac
 import json
+import os
 from pathlib import Path
+import queue
+import secrets
 import signal
 import subprocess
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlsplit
+from http.cookies import SimpleCookie, CookieError
+from urllib.parse import urlsplit, parse_qs
+from memory import VoiceMemory
 
 ROOT = Path(__file__).resolve().parent
 EFFORTS = {'low', 'medium', 'high', 'xhigh', 'ultra'}
@@ -33,8 +41,77 @@ class RequestError(Exception):
     pass
 
 
+class RemoteAccess:
+    """One-use pairing and process-local sessions; credentials never enter Codex."""
+    cookie_name = '__Host-codex_voice'
+    session_seconds = 12 * 60 * 60
+
+    def __init__(self, origin, pairing_code=None):
+        parsed = urlsplit(origin)
+        if (parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.password
+                or parsed.path not in ('', '/') or parsed.query or parsed.fragment
+                or parsed.port not in (None, 443)):
+            raise ValueError('Remote origin must be an exact HTTPS origin.')
+        self.origin = 'https://' + parsed.netloc
+        self.host = parsed.netloc
+        self.pairing_code = pairing_code or secrets.token_urlsafe(24)
+        self.pairing_expires = time.monotonic() + 30 * 60
+        self.sessions = {}
+        self.last_activity = time.monotonic()
+        self.attempts = collections.deque()
+        self.lock = threading.Lock()
+
+    @staticmethod
+    def digest(value):
+        return hashlib.sha256(value.encode()).hexdigest()
+
+    def session_key(self, cookie_header):
+        try:
+            cookie = SimpleCookie()
+            cookie.load(cookie_header or '')
+            value = cookie[self.cookie_name].value if self.cookie_name in cookie else ''
+            return self.digest(value) if value else None
+        except (CookieError, ValueError):
+            return None
+
+    def valid(self, cookie_header):
+        key = self.session_key(cookie_header)
+        with self.lock:
+            now = time.monotonic()
+            self.sessions = {k: expiry for k, expiry in self.sessions.items() if expiry > now}
+            if key in self.sessions:
+                self.last_activity = now
+                return True
+            return False
+
+    def voice_lease_active(self):
+        with self.lock:
+            now = time.monotonic()
+            return any(expiry > now for expiry in self.sessions.values()) and now - self.last_activity < 90
+
+    def pair(self, code):
+        with self.lock:
+            now = time.monotonic()
+            while self.attempts and self.attempts[0] <= now - 60:
+                self.attempts.popleft()
+            if len(self.attempts) >= 12:
+                return None
+            self.attempts.append(now)
+            if (not isinstance(code, str) or not self.pairing_code or now >= self.pairing_expires
+                    or not hmac.compare_digest(code.encode(), self.pairing_code.encode())):
+                return None
+            self.pairing_code = None
+            token = secrets.token_urlsafe(32)
+            self.sessions[self.digest(token)] = now + self.session_seconds
+            return token
+
+    def revoke(self, cookie_header):
+        with self.lock:
+            self.sessions.pop(self.session_key(cookie_header), None)
+
+
 class Codex:
-    def __init__(self, cwd, model='gpt-6-astra', permission_mode='ask'):
+    def __init__(self, cwd, model='gpt-6-astra', permission_mode='ask', memory=None, memory_index_command=None):
         if permission_mode not in PERMISSION_MODES:
             raise RequestError('Unbekannter Freigabemodus.')
         self.default_permission_mode = permission_mode
@@ -50,16 +127,29 @@ class Codex:
         self.answer = None
         self.voice_error = None
         self.closed = False
+        self.memory = memory
+        self.memory_index_command = memory_index_command
+        self.memory_index_process = None
+        self.memory_index_dirty = False
+        self.memory_queue = queue.Queue()
+        self.memory_failed = []
+        self.memory_thread = None
+        self.known_threads = {}
         self.state = {'threadId': None, 'cwd': str(Path(cwd).expanduser().resolve()),
                       'model': model, 'effort': 'high', 'voiceActive': False,
                       'permissionMode': permission_mode,
                       'activeTurnId': None, 'voiceStatus': 'idle'}
+        if memory:
+            self.state.update(memoryEnabled=True, memoryServerTranscripts=True, memoryStatus='ready')
+            self.memory_thread = threading.Thread(target=self.memory_worker, daemon=True)
+            self.memory_thread.start()
         self.process = subprocess.Popen(
             ['codex', 'app-server', '--enable', 'realtime_conversation'],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             text=True, bufsize=1,
         )
-        threading.Thread(target=self.read, daemon=True).start()
+        self.reader_thread = threading.Thread(target=self.read, daemon=True)
+        self.reader_thread.start()
         try:
             self.rpc('initialize', {'clientInfo': {'name': 'codex-voice-local', 'version': '0.2.0'},
                                     'capabilities': {'experimentalApi': True}})
@@ -106,6 +196,62 @@ class Codex:
         with self.condition:
             return dict(self.state)
 
+    def memory_worker(self):
+        while True:
+            item = self.memory_queue.get()
+            try:
+                if item is None:
+                    return
+                self.memory.record(*item)
+                with self.condition:
+                    self.memory_index_dirty = True
+                    self.state['memoryStatus'] = 'error' if self.memory_failed else 'saved'
+                self.emit('state', self.snapshot())
+            except Exception:
+                with self.condition:
+                    self.memory_failed.append(item)
+                    self.state['memoryStatus'] = 'error'
+                self.emit('state', self.snapshot())
+            finally:
+                self.memory_queue.task_done()
+
+    def capture(self, role, text, item_id, thread_id=None):
+        if not self.memory or not isinstance(text, str) or not text.strip():
+            return
+        ident = thread_id or self.state['threadId']
+        if role not in ('user', 'assistant') or ident not in self.known_threads:
+            return
+        with self.condition:
+            self.state['memoryStatus'] = 'saving'
+        self.memory_queue.put((ident, self.known_threads[ident], role, text, str(item_id)))
+
+    def flush_memory(self):
+        if not self.memory:
+            return
+        with self.condition:
+            failed, self.memory_failed = self.memory_failed, []
+        for item in failed:
+            self.memory_queue.put(item)
+        deadline = time.monotonic() + 3
+        while self.memory_queue.unfinished_tasks and time.monotonic() < deadline:
+            time.sleep(0.02)
+        if not self.memory_queue.unfinished_tasks and not self.memory_failed:
+            self.memory.flush()
+            if self.memory_index_dirty and self.memory_index_command and (self.memory_index_process is None or self.memory_index_process.poll() is not None):
+                self.memory_index_process = subprocess.Popen(self.memory_index_command, stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                self.memory_index_dirty = False
+
+    def save_transcript(self, data):
+        ident, role, text, item_id = (data.get(k) for k in ('threadId', 'role', 'text', 'itemId'))
+        if (not self.memory or ident not in self.known_threads or role not in ('user', 'assistant')
+                or not isinstance(text, str) or not text.strip() or len(text) > 60000
+                or not isinstance(item_id, str) or not item_id or len(item_id) > 256):
+            raise RequestError('Ungültiger Gesprächseintrag.')
+        # Browser fallbacks are acknowledged only after their durable write.
+        self.memory.record(ident, self.known_threads[ident], role, text, item_id)
+        return {'saved': True}
+
     def read(self):
         try:
             for line in self.process.stdout:
@@ -142,6 +288,12 @@ class Codex:
                 # Subagent and previous-thread notifications must not change this session.
                 if params.get('threadId') and params['threadId'] != self.state['threadId']:
                     continue
+                if method == 'thread/realtime/transcript/done':
+                    self.capture(params.get('role'), params.get('text'),
+                                 params.get('itemId') or f'voice-{time.time_ns()}')
+                elif method == 'item/completed' and (params.get('item') or {}).get('type') == 'agentMessage':
+                    item = params['item']
+                    self.capture('assistant', item.get('text'), item.get('id') or f'task-{time.time_ns()}')
                 changed = False
                 with self.condition:
                     if method == 'item/started' and (params.get('item') or {}).get('type') == 'fileChange':
@@ -208,6 +360,7 @@ class Codex:
                 self.state.update(threadId=result['thread']['id'], cwd=str(cwd), effort=effort,
                                   activeTurnId=None, voiceActive=False, voiceStatus='idle',
                                   permissionMode=permission_mode)
+                self.known_threads[self.state['threadId']] = str(cwd)
                 self.file_changes.clear()
             self.emit('state', self.snapshot())
             return self.snapshot()
@@ -252,6 +405,7 @@ class Codex:
                 self.rpc('thread/realtime/stop', {'threadId': ident}, timeout=15)
             with self.condition:
                 self.state.update(voiceActive=False, voiceStatus='idle')
+            self.flush_memory()
             self.emit('state', self.snapshot())
             return self.snapshot()
 
@@ -274,6 +428,7 @@ class Codex:
         else:
             params['effort'] = self.state['effort']
             self.rpc('turn/start', params)
+        self.capture('user', text, f'text-{time.time_ns()}')
         return self.snapshot()
 
     def approve(self, data):
@@ -314,10 +469,29 @@ class Codex:
         except subprocess.TimeoutExpired:
             self.process.kill()
             self.process.wait()
+        # Drain final protocol notifications before closing the archive worker.
+        if threading.current_thread() is not self.reader_thread:
+            self.reader_thread.join(timeout=3)
+        if self.memory_thread and self.memory_thread.is_alive():
+            self.flush_memory()
+            self.memory_queue.put(None)
+            self.memory_thread.join(timeout=3)
+            if not self.memory_thread.is_alive():
+                self.memory.close()
 
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
+
+    def setup(self):
+        super().setup()
+        self.connection.settimeout(30)
+
+    def handle(self):
+        try:
+            super().handle()
+        except (TimeoutError, BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
 
     def log_message(self, *_):
         pass  # Never log SDP, conversation content or request bodies.
@@ -325,19 +499,34 @@ class Handler(BaseHTTPRequestHandler):
     def authorized(self, mutation=False):
         port = self.server.server_port
         hosts = {f'127.0.0.1:{port}', f'localhost:{port}'}
-        if self.headers.get('Host') not in hosts:
+        remote = getattr(self.server, 'remote_access', None)
+        host = self.headers.get('Host')
+        if remote:
+            hosts.add(remote.host)
+        if len(self.headers.get_all('Host', [])) != 1 or host not in hosts:
+            return False
+        if remote and host == remote.host and self.headers.get('X-Forwarded-Proto', 'https') != 'https':
             return False
         origin = self.headers.get('Origin')
-        return not mutation or origin in {f'http://{host}' for host in hosts}
+        expected = remote.origin if remote and host == remote.host else f'http://{host}'
+        return not mutation or (len(self.headers.get_all('Origin', [])) == 1 and origin == expected)
 
-    def reply(self, status, data, mime='application/json'):
+    def authenticated(self):
+        remote = getattr(self.server, 'remote_access', None)
+        return not remote or remote.valid(self.headers.get('Cookie'))
+
+    def reply(self, status, data, mime='application/json', headers=None):
         raw = json.dumps(data, ensure_ascii=False).encode() if mime == 'application/json' else data
         self.send_response(status)
         self.send_header('Content-Type', mime + '; charset=utf-8')
         self.send_header('Content-Length', str(len(raw)))
         self.send_header('Cache-Control', 'no-store')
         self.send_header('X-Content-Type-Options', 'nosniff')
+        self.send_header('Referrer-Policy', 'no-referrer')
+        self.send_header('Permissions-Policy', 'camera=(), microphone=(self)')
         self.send_header('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; media-src 'self' blob:; frame-ancestors 'none'")
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(raw)
 
@@ -345,9 +534,23 @@ class Handler(BaseHTTPRequestHandler):
         if not self.authorized():
             return self.reply(403, {'error': 'Unzulässiger Host.'})
         path = urlsplit(self.path).path
+        if not self.authenticated():
+            public = {'/': ('pair.html', 'text/html'), '/index.html': ('pair.html', 'text/html'),
+                      '/pair.js': ('pair.js', 'text/javascript'), '/pair.css': ('pair.css', 'text/css')}
+            if path in public:
+                name, mime = public[path]
+                return self.reply(200, (ROOT / 'static' / name).read_bytes(), mime)
+            return self.reply(401, {'error': 'Bitte dieses Gerät erneut koppeln.'})
         if path == '/api/state':
-            return self.reply(200, self.server.codex.snapshot())
+            state = self.server.codex.snapshot()
+            if getattr(self.server, 'remote_access', None):
+                state.update(clientTransport='poll')
+            return self.reply(200, state)
+        if path == '/api/events/poll':
+            return self.poll_events()
         if path == '/api/events':
+            if getattr(self.server, 'remote_access', None):
+                return self.reply(400, {'error': 'Diese Verbindung verwendet Ereignis-Polling.'})
             return self.stream()
         names = {'/': 'index.html', '/index.html': 'index.html', '/app.js': 'app.js', '/style.css': 'style.css'}
         name = names.get(path)
@@ -358,6 +561,23 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(503, {'error': 'Oberfläche noch nicht verfügbar.'})
         mime = {'.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css'}[p.suffix]
         self.reply(200, p.read_bytes(), mime)
+
+    def poll_events(self):
+        try:
+            query = parse_qs(urlsplit(self.path).query)
+            after = max(0, int(query.get('after', ['0'])[0]))
+            wait = min(20, max(0, int(query.get('wait', ['20'])[0])))
+        except (ValueError, TypeError):
+            return self.reply(400, {'error': 'Ungültiger Ereignis-Cursor.'})
+        codex = self.server.codex
+        with codex.condition:
+            codex.condition.wait_for(lambda: codex.event_id > after or codex.closed, timeout=wait)
+            events = [{'id': i, **event} for i, event in codex.events if i > after]
+            cursor = codex.event_id
+        # A cookie may have expired or been revoked while the poll was waiting.
+        if not self.authenticated():
+            return self.reply(401, {'error': 'Bitte dieses Gerät erneut koppeln.'})
+        return self.reply(200, {'events': events, 'cursor': cursor, 'state': codex.snapshot()})
 
     def stream(self):
         self.send_response(200)
@@ -386,19 +606,39 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if not self.authorized(mutation=True):
-            return self.reply(403, {'error': 'Nur die lokale Sprachoberfläche darf diese Aktion auslösen.'})
+            return self.reply(403, {'error': 'Nur die zugehörige Sprachoberfläche darf diese Aktion auslösen.'})
+        path = urlsplit(self.path).path
+        remote = getattr(self.server, 'remote_access', None)
+        if not self.authenticated() and not (remote and path == '/api/pair'):
+            self.close_connection = True
+            return self.reply(401, {'error': 'Bitte dieses Gerät erneut koppeln.'})
         try:
+            if self.headers.get('Transfer-Encoding') or len(self.headers.get_all('Content-Length', [])) > 1:
+                self.close_connection = True
+                return self.reply(400, {'error': 'Ungültige Anfrage.'})
             length = int(self.headers.get('Content-Length', '0'))
-            if not 0 <= length <= 150000:
+            if not 0 <= length <= (4096 if path == '/api/pair' else 150000):
+                self.close_connection = True
                 return self.reply(413, {'error': 'Anfrage zu groß.'})
             data = json.loads(self.rfile.read(length) or b'{}')
             if not isinstance(data, dict):
                 raise ValueError()
+            if remote and path == '/api/pair':
+                token = remote.pair(data.get('code'))
+                if not token:
+                    return self.reply(403, {'error': 'Kopplungscode ungültig, abgelaufen oder bereits verwendet.'})
+                cookie = f'{remote.cookie_name}={token}; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age={remote.session_seconds}'
+                return self.reply(200, {'ok': True}, headers={'Set-Cookie': cookie})
+            if remote and path == '/api/logout':
+                remote.revoke(self.headers.get('Cookie'))
+                cookie = f'{remote.cookie_name}=; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=0'
+                return self.reply(200, {'ok': True}, headers={'Set-Cookie': cookie})
             codex = self.server.codex
             actions = {'/api/session': lambda: codex.session(data),
                        '/api/voice/start': lambda: codex.start_voice(data),
                        '/api/voice/stop': codex.stop_voice, '/api/interrupt': codex.interrupt,
-                       '/api/text': lambda: codex.text(data), '/api/approval': lambda: codex.approve(data)}
+                       '/api/text': lambda: codex.text(data), '/api/approval': lambda: codex.approve(data),
+                       '/api/memory/transcript': lambda: codex.save_transcript(data)}
             action = actions.get(urlsplit(self.path).path)
             if action is None:
                 return self.reply(404, {'error': 'Nicht gefunden.'})
@@ -417,14 +657,52 @@ def main():
     parser.add_argument('--cwd', default=str(Path.cwd()))
     parser.add_argument('--model', default='gpt-6-astra', help='Codex model for tasks (voice uses its own model)')
     parser.add_argument('--yolo', action='store_true', help='Default new sessions to full access without approval prompts')
+    parser.add_argument('--remote-origin', help='Exact HTTPS tunnel origin; enables pairing on every route')
+    parser.add_argument('--pairing-file', help='Private connection receipt outside the source checkout')
+    parser.add_argument('--memory-dir', help='Opt-in private Markdown conversation archive outside this checkout')
+    parser.add_argument('--memory-index-script', help='Optional local Python indexer to trigger after voice ends')
+    parser.add_argument('--memory-index-python', default=sys.executable, help='Python interpreter for the optional indexer')
     args = parser.parse_args()
+    if bool(args.remote_origin) != bool(args.pairing_file):
+        parser.error('--remote-origin and --pairing-file must be used together')
     server = ThreadingHTTPServer(('127.0.0.1', args.port), Handler)
+    server.daemon_threads = True
+    if args.remote_origin:
+        server.remote_access = RemoteAccess(args.remote_origin)
     try:
-        codex = Codex(args.cwd, model=args.model, permission_mode='yolo' if args.yolo else 'ask')
+        memory = VoiceMemory(args.memory_dir) if args.memory_dir else None
+        index_command = [args.memory_index_python, str(Path(args.memory_index_script).expanduser().resolve())] if args.memory_index_script else None
+        codex = Codex(args.cwd, model=args.model, permission_mode='yolo' if args.yolo else 'ask',
+                      memory=memory, memory_index_command=index_command)
     except Exception:
         server.server_close()
         raise
     server.codex = codex
+    if args.remote_origin:
+        def watch_voice_lease():
+            while not codex.closed:
+                time.sleep(5)
+                if codex.snapshot()['voiceActive'] and not server.remote_access.voice_lease_active():
+                    try:
+                        codex.stop_voice()
+                    except Exception:
+                        pass
+        threading.Thread(target=watch_voice_lease, daemon=True).start()
+    if args.remote_origin:
+        receipt = Path(args.pairing_file).expanduser().resolve()
+        if receipt == ROOT or ROOT in receipt.parents:
+            codex.close()
+            server.server_close()
+            raise ValueError('Keep the private pairing receipt outside the source checkout.')
+        receipt.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        connection = {'origin': server.remote_access.origin,
+                      'pairing_url': server.remote_access.origin + '/#pair=' + server.remote_access.pairing_code,
+                      'pairing_valid_seconds': 1800, 'server_pid': os.getpid(),
+                      'permission_mode': codex.default_permission_mode}
+        fd = os.open(receipt, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, 'w') as handle:
+            json.dump(connection, handle, indent=2)
     signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
     print(f'Codex Voice: http://127.0.0.1:{server.server_port}', flush=True)
     print('Mikrofon startet erst nach Klick im Browser. Beenden mit Ctrl+C.', flush=True)

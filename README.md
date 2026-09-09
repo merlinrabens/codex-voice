@@ -13,7 +13,7 @@ Codex Voice starts your installed `codex app-server` and uses its experimental R
 - Account access to the requested Codex model and experimental Realtime voice. Availability and voice allowances depend on your account.
 - A browser with WebRTC and microphone support. Chrome on macOS is the tested browser.
 
-The interface and Codex run on the same computer. This is a local application, not a public web service or a hosted Codex session.
+By default the interface and Codex run on the same computer. Optional paired HTTPS access lets a phone reach that computer while Codex continues to run there. A ChatGPT desktop installation is not required.
 
 ## Run
 
@@ -44,6 +44,32 @@ codex-voice --cwd /path/to/your/project --port 8766
 
 If that command name already exists, use `./bin/codex-voice` directly or choose another symlink name.
 
+## Temporary iPhone access
+
+With `cloudflared` installed, start a temporary HTTPS tunnel and the authenticated voice server:
+
+```sh
+python3 remote.py --cwd /path/to/your/project --keep-awake
+```
+
+Open the `pairing_url` from the private `~/.codex/voice-access/connection.json` file in Safari on your iPhone. Tap **Mit meinem Mac verbinden**, then start voice and allow microphone access. The phone can use mobile data or a different Wi-Fi network. Add `--yolo` only when you want the same unrestricted task permissions as the local mode.
+
+The link pairs one browser, expires after 30 minutes, and is consumed once. Its code is carried in the URL fragment, removed before the page makes requests, and exchanged for a Secure, HttpOnly cookie. Treat the link as private. The browser session lasts up to 12 hours; restarting the server revokes it and generates a different tunnel URL. The private receipt is kept outside this checkout. `POST /api/logout` revokes the current browser session.
+
+The Mac and launcher must stay running and online. `--keep-awake` prevents idle sleep on macOS while the launcher is running; it does not guarantee operation with a laptop lid closed. Keep Safari open during voice. If iOS interrupts the microphone or blocks playback, the page offers a restart or audio button. Real iPhone hardware behavior still needs device testing; browser emulation alone does not establish it.
+
+Audio continues over WebRTC directly between the browser and OpenAI. Cloudflare proxies the authenticated interface and control requests, not an extra audio-processing pipeline. Network conditions still affect latency. Quick Tunnels are temporary development connections without an uptime guarantee and do not support SSE, so remote mode uses authenticated JSON long polling for task events. [Cloudflare Quick Tunnels](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/do-more-with-tunnels/trycloudflare/)
+
+Stop the launcher with **Ctrl+C** to stop the server and tunnel. No Cloudflare account or ChatGPT desktop app is required for this temporary mode.
+
+## Optional conversation memory
+
+Add `--memory-dir /path/to/private/vault/Conversations` to either launcher to keep finalized spoken turns, submitted text prompts and completed Astra text replies as private Markdown. One archive is maintained per Codex thread, with speaker, capture time and source IDs. Intermediate transcript fragments and tool outputs are not copied. The UI reports saved or failed writes. Files are written atomically and repeated source items are deduplicated; new final revisions preserve earlier text.
+
+The archive is an unverified conversation source, not a list of established facts. Audio recordings and authentication tokens are not saved by this feature. Choose a folder outside the source checkout and covered by your own backup and retrieval setup. Archival is opt-in in the public project; no private folder is assumed.
+
+If you already run a notes indexer, `--memory-index-script /path/to/indexer.py` triggers it after voice ends; `--memory-index-python /path/to/venv/bin/python3` selects its interpreter. This hook is configured locally, never by the phone. The existing indexer can discover archives during longer conversations as well. Search freshness depends on that indexer's schedule and embedding completion; saved Markdown is immediately available for file-based search. This does not automatically capture unrelated Codex CLI sessions.
+
 ## How the session works
 
 - Voice streams continuously over WebRTC after you connect. You do not need to submit each spoken message.
@@ -72,7 +98,7 @@ In the official Intel macOS desktop build inspected on September 9, 2026 (`26.90
 
 ## Data and access
 
-The HTTP server binds to `127.0.0.1` and checks local host and request-origin headers. Keep it local; it has no account system or remote-access authentication. Other software running on your computer can reach a loopback service.
+The HTTP server binds to `127.0.0.1` and checks host and request-origin headers. Default local mode has no account system; other software running on your computer can reach the loopback service. Use `remote.py` for internet access: it explicitly enables session authentication on every private route, including loopback requests. Do not publish an unauthenticated local-mode server through a proxy.
 
 Microphone audio is sent to OpenAI through the browser's WebRTC connection. Project context and task activity are handled by your Codex session. The application does not save audio recordings, copy authentication files, or log HTTP request bodies. Codex retains its normal session history according to your configuration. Existing ChatGPT plan access, usage limits, and voice allowances still apply.
 
@@ -86,6 +112,9 @@ Offline checks do not call a model, use a microphone, or operate the desktop:
 
 ```sh
 python3 tests.py
+python3 tests_remote.py
+python3 tests_memory.py
+python3 tests_memory_integration.py
 python3 scripts/publication_audit.py
 ```
 
