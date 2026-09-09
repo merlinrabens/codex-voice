@@ -29,3 +29,30 @@
 @media(max-width:760px),(pointer:coarse){.mobile-note{display:block}.button{min-height:44px}.session-form input,.session-form select,.composer textarea{font-size:16px}.session-form input,.session-form select{height:44px}.voice-control .button{min-height:44px}}
 @media(max-width:440px){.session-form>label,.session-form>input{grid-column:1/-1}.session-bottom{grid-column:1/-1;grid-row:auto;margin-top:15px}.session-bottom .small{min-height:44px;font-size:12px;padding:10px 15px}.session-form select{padding-left:11px;padding-right:11px}}
 @supports(padding:max(0px)){.shell{padding-left:max(15px,env(safe-area-inset-left));padding-right:max(15px,env(safe-area-inset-right))}.page-footer{padding-bottom:max(20px,env(safe-area-inset-bottom))}@media(min-width:761px){.shell{padding-left:30px;padding-right:30px}}@media(min-width:1101px){.shell{padding-left:48px;padding-right:48px}}}
+
+/* Give phone screens one clear reading order and a full-width voice action. */
+@media(max-width:600px){
+  .workspace{padding-top:24px;gap:24px}
+  .control-panel{display:flex;flex-direction:column;gap:0;min-width:0}
+  .intro{text-align:center;padding-top:0}
+  .eyebrow{font-size:9px;margin-bottom:12px}
+  h1{font-size:40px;line-height:1.1;letter-spacing:-1.8px}
+  .intro-copy{font-size:13px;max-width:310px;margin:12px auto 0}
+  .voice-control{width:100%;max-width:440px;align-self:center;margin-top:20px}
+  .orb-wrap{height:110px}
+  .orb{width:84px;height:84px}
+  .orb-halo,.mic-ring-outer{width:108px;height:108px}
+  .mic-ring-inner{width:96px;height:96px}
+  .voice-status{font-size:14px;margin-top:8px}
+  .voice-detail{font-size:12px;margin-bottom:16px}
+  .voice-control .button{min-height:50px;font-size:15px;padding:12px 16px}
+  .privacy-note,.mobile-note,.capability-note,.memory-status,.wake-status{font-size:11px;line-height:1.5}
+  .capability-note{text-align:center;padding-top:10px;margin-top:12px}
+  .session-form{width:100%;grid-template-columns:minmax(0,1fr);margin-top:24px;padding-top:20px}
+  .session-form>label,.session-form>input,.session-bottom{grid-column:1/-1}
+  .session-bottom{grid-row:auto;margin-top:14px;gap:10px}
+  .session-form label{font-size:12px}
+  .section-label{font-size:10px}
+  .session-bottom .small{font-size:12px;min-height:44px;padding:10px 12px}
+  .field-hint,.permission-hint{font-size:11px}
+}
