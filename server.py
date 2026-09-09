@@ -111,6 +111,9 @@ class RemoteAccess:
 
 
 class Codex:
+    memory_index_retry_seconds = 1.0
+    memory_index_coalesce_seconds = 0.15
+
     def __init__(self, cwd, model='gpt-6-astra', permission_mode='ask', memory=None, memory_index_command=None):
         if permission_mode not in PERMISSION_MODES:
             raise RequestError('Unbekannter Freigabemodus.')
@@ -131,6 +134,10 @@ class Codex:
         self.memory_index_command = memory_index_command
         self.memory_index_process = None
         self.memory_index_dirty = False
+        self.memory_index_requested = False
+        self.memory_index_not_before = 0
+        self.memory_index_shutdown = False
+        self.memory_index_thread = None
         self.memory_queue = queue.Queue()
         self.memory_failed = []
         self.memory_thread = None
@@ -143,6 +150,10 @@ class Codex:
             self.state.update(memoryEnabled=True, memoryServerTranscripts=True, memoryStatus='ready')
             self.memory_thread = threading.Thread(target=self.memory_worker, daemon=True)
             self.memory_thread.start()
+            if memory_index_command:
+                self.state['memoryIndexStatus'] = 'ready'
+                self.memory_index_thread = threading.Thread(target=self.memory_index_worker, daemon=True)
+                self.memory_index_thread.start()
         self.process = subprocess.Popen(
             ['codex', 'app-server', '--enable', 'realtime_conversation'],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
@@ -202,11 +213,7 @@ class Codex:
             try:
                 if item is None:
                     return
-                self.memory.record(*item)
-                with self.condition:
-                    self.memory_index_dirty = True
-                    self.state['memoryStatus'] = 'error' if self.memory_failed else 'saved'
-                self.emit('state', self.snapshot())
+                self.memory_recorded(self.memory.record(*item), item[0])
             except Exception:
                 with self.condition:
                     self.memory_failed.append(item)
@@ -214,6 +221,72 @@ class Codex:
                 self.emit('state', self.snapshot())
             finally:
                 self.memory_queue.task_done()
+
+    def memory_recorded(self, result, thread_id):
+        with self.condition:
+            if result.get('saved'):
+                if not self.memory_index_dirty:
+                    self.memory_index_not_before = time.monotonic() + self.memory_index_coalesce_seconds
+                self.memory_index_dirty = True
+                if thread_id != self.state['threadId'] or not self.state['voiceActive']:
+                    # Completed conversations must remain eligible even if another
+                    # voice session starts before the coalescing delay expires.
+                    self.memory_index_requested = True
+                if self.memory_index_command and self.state.get('memoryIndexStatus') != 'indexing':
+                    self.state['memoryIndexStatus'] = 'pending'
+            self.state['memoryStatus'] = 'error' if self.memory_failed else 'saved'
+            self.condition.notify_all()
+        self.emit('state', self.snapshot())
+
+    def memory_index_worker(self):
+        """Serialize indexing and retain a follow-up for writes made during a run."""
+        failures = 0
+        while True:
+            with self.condition:
+                while True:
+                    if self.memory_index_shutdown and not self.memory_index_dirty:
+                        return
+                    remaining = self.memory_index_not_before - time.monotonic()
+                    eligible = self.memory_index_requested or not self.state['voiceActive'] or self.memory_index_shutdown
+                    if self.memory_index_dirty and eligible and remaining <= 0:
+                        break
+                    self.condition.wait(timeout=max(0.01, min(1.0, remaining)) if remaining > 0 else 1.0)
+                # Clear only the generation being started. Later writes set dirty again.
+                self.memory_index_dirty = False
+                self.memory_index_requested = False
+                self.state['memoryIndexStatus'] = 'indexing'
+            self.emit('state', self.snapshot())
+            try:
+                process = subprocess.Popen(self.memory_index_command, stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                with self.condition:
+                    self.memory_index_process = process
+                while process.poll() is None:
+                    with self.condition:
+                        self.condition.wait(timeout=0.1)
+                succeeded = process.wait() == 0
+            except Exception:
+                succeeded = False
+            with self.condition:
+                self.memory_index_process = None
+                if succeeded:
+                    failures = 0
+                    # A new conversation can already be active. Its pending writes
+                    # still need the follow-up promised by the previous flush.
+                    self.memory_index_requested = self.memory_index_dirty
+                    self.state['memoryIndexStatus'] = 'pending' if self.memory_index_dirty else 'indexed'
+                else:
+                    failures += 1
+                    self.memory_index_dirty = True
+                    self.memory_index_requested = True
+                    delay = min(60.0, self.memory_index_retry_seconds * 2 ** min(failures - 1, 6))
+                    self.memory_index_not_before = time.monotonic() + delay
+                    self.state['memoryIndexStatus'] = 'error'
+                stopping_after_failure = self.memory_index_shutdown and not succeeded
+                self.condition.notify_all()
+            self.emit('state', self.snapshot())
+            if stopping_after_failure:
+                return
 
     def capture(self, role, text, item_id, thread_id=None):
         if not self.memory or not isinstance(text, str) or not text.strip():
@@ -237,10 +310,11 @@ class Codex:
             time.sleep(0.02)
         if not self.memory_queue.unfinished_tasks and not self.memory_failed:
             self.memory.flush()
-            if self.memory_index_dirty and self.memory_index_command and (self.memory_index_process is None or self.memory_index_process.poll() is not None):
-                self.memory_index_process = subprocess.Popen(self.memory_index_command, stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                self.memory_index_dirty = False
+            with self.condition:
+                if self.memory_index_dirty:
+                    self.memory_index_requested = True
+                    self.memory_index_not_before = 0
+                self.condition.notify_all()
 
     def save_transcript(self, data):
         ident, role, text, item_id = (data.get(k) for k in ('threadId', 'role', 'text', 'itemId'))
@@ -249,7 +323,13 @@ class Codex:
                 or not isinstance(item_id, str) or not item_id or len(item_id) > 256):
             raise RequestError('Ungültiger Gesprächseintrag.')
         # Browser fallbacks are acknowledged only after their durable write.
-        self.memory.record(ident, self.known_threads[ident], role, text, item_id)
+        try:
+            self.memory_recorded(self.memory.record(ident, self.known_threads[ident], role, text, item_id), ident)
+        except Exception:
+            with self.condition:
+                self.state['memoryStatus'] = 'error'
+            self.emit('state', self.snapshot())
+            raise
         return {'saved': True}
 
     def read(self):
@@ -285,15 +365,20 @@ class Codex:
                                    'message': 'Diese Anfrage benötigt einen vollständigen Codex-Client.'}})
                         self.emit('client/notice', {'message': 'Eine interaktive Tool-Anfrage benötigt die Terminaloberfläche.'})
                     continue
-                # Subagent and previous-thread notifications must not change this session.
-                if params.get('threadId') and params['threadId'] != self.state['threadId']:
-                    continue
+                # Archive known original threads before filtering UI notifications.
+                # A finalized transcript can arrive after a new session is opened.
+                source_thread = params.get('threadId')
                 if method == 'thread/realtime/transcript/done':
-                    self.capture(params.get('role'), params.get('text'),
-                                 params.get('itemId') or f'voice-{time.time_ns()}')
+                    if source_thread in self.known_threads:
+                        self.capture(params.get('role'), params.get('text'),
+                                     params.get('itemId') or f'voice-{time.time_ns()}', source_thread)
                 elif method == 'item/completed' and (params.get('item') or {}).get('type') == 'agentMessage':
                     item = params['item']
-                    self.capture('assistant', item.get('text'), item.get('id') or f'task-{time.time_ns()}')
+                    if source_thread in self.known_threads:
+                        self.capture('assistant', item.get('text'), item.get('id') or f'task-{time.time_ns()}', source_thread)
+                # Subagent and previous-thread notifications must not change this session.
+                if source_thread and source_thread != self.state['threadId']:
+                    continue
                 changed = False
                 with self.condition:
                     if method == 'item/started' and (params.get('item') or {}).get('type') == 'fileChange':
@@ -428,7 +513,7 @@ class Codex:
         else:
             params['effort'] = self.state['effort']
             self.rpc('turn/start', params)
-        self.capture('user', text, f'text-{time.time_ns()}')
+        self.capture('user', text, f'text-{time.time_ns()}', params['threadId'])
         return self.snapshot()
 
     def approve(self, data):
@@ -478,6 +563,13 @@ class Codex:
             self.memory_thread.join(timeout=3)
             if not self.memory_thread.is_alive():
                 self.memory.close()
+        if self.memory_index_thread and self.memory_index_thread.is_alive():
+            with self.condition:
+                self.memory_index_shutdown = True
+                self.memory_index_requested = True
+                self.memory_index_not_before = 0
+                self.condition.notify_all()
+            self.memory_index_thread.join(timeout=3)
 
 
 class Handler(BaseHTTPRequestHandler):
