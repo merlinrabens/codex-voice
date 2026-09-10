@@ -19,10 +19,8 @@
     copyStatus.textContent = '';
     try {
       await navigator.clipboard.writeText(command.textContent);
-      copyButton.textContent = 'Copied';
       copyStatus.textContent = 'Command copied to clipboard.';
     } catch {
-      copyButton.textContent = 'Copy';
       copyStatus.textContent = 'Could not copy automatically. Select and copy the command above.';
       const selection = window.getSelection();
       if (selection) {

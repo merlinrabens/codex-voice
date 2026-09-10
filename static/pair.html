@@ -30,7 +30,12 @@
       <p>A code expires after 30 minutes and works only once. If your login has expired or you no longer have a code, run this command in the project folder on your Mac:</p>
       <div class="command-row">
         <pre><code id="pair-command">python3 remote.py --pair --copy</code></pre>
-        <button id="copy-command" class="copy-command" type="button" aria-label="Copy recovery command">Copy</button>
+        <button id="copy-command" class="copy-command" type="button" aria-label="Copy recovery command" title="Copy recovery command">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+            <rect x="8" y="8" width="14" height="14" rx="2" />
+            <path d="M4 16a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2" />
+          </svg>
+        </button>
       </div>
       <p id="copy-status" role="status" aria-live="polite"></p>
       <p>Open the new link from your Mac's clipboard on this device. The command keeps the running tunnel and conversation in place.</p>
