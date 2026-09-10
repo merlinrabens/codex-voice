@@ -7,6 +7,7 @@
 .voice-field select{width:100%;min-width:0;min-height:40px;border:1px solid #ffffff20;border-radius:7px;background:#181c15;color:#c9cfc0;font-size:12px;padding:9px 11px}
 .voice-field select:disabled{opacity:.65;cursor:not-allowed}
 .voice-field p{font-size:10px;line-height:1.5;color:#8a927e;margin:7px 0 0}
+.voice-control[data-phase=switching] .orb-halo{border:1px solid #a3b78620;border-top-color:#cee8a0;animation:spin 1.4s linear infinite}
 @media(max-width:760px),(pointer:coarse){.voice-field select{font-size:16px;min-height:44px}.voice-field label,.voice-field p{font-size:11px}}
 
 /* The microphone rings are driven by measured input amplitude, never by output audio. */

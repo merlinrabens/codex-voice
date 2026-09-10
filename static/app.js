@@ -24,6 +24,8 @@ if (new URLSearchParams(location.hash.slice(1)).has('pair')) {
   let textBusy = false;
   let voiceStartPending = false;
   let voiceStopPending = false;
+  let voiceSwitchPending = false;
+  let voiceCloseWaiter = null;
   let spokenReplyId = null;
   let sessionRequest = null;
   let micMeter = null;
@@ -50,7 +52,7 @@ if (new URLSearchParams(location.hash.slice(1)).has('pair')) {
   // V3 supports a subset of Codex's shared RealtimeVoice enum. Also filter
   // older running servers that still advertise the full mixed-version list.
   const v3Voices = new Set(['arbor', 'breeze', 'cove', 'ember', 'juniper', 'maple', 'sol', 'spruce', 'vale']);
-  const voiceHint = 'To change voices, end voice, choose one, and start again. Your Codex session stays open.';
+  const voiceHint = 'Change voices anytime. Audio briefly pauses while reconnecting; your Codex session stays open.';
   let savedVoiceChoice = null;
   let voiceChoiceExplicit = false;
   let voiceChoiceReset = false;
@@ -144,6 +146,7 @@ if (new URLSearchParams(location.hash.slice(1)).has('pair')) {
     el('voice-hint').textContent = voiceHint;
     savedVoiceChoice = choice;
     try { localStorage.setItem(voiceStorageKey, choice); } catch { /* Keep this page's explicit choice. */ }
+    if (state.voiceSwitchSupported && peer && ['connected', 'muted'].includes(voicePhase)) void switchVoice();
   });
 
   async function api(path, body, { signal, timeout = 65000 } = {}) {
@@ -287,7 +290,7 @@ if (new URLSearchParams(location.hash.slice(1)).has('pair')) {
   }
 
   function renderControls() {
-    const inVoice = ['connecting', 'connected', 'muted', 'background', 'interrupted'].includes(voicePhase);
+    const inVoice = ['connecting', 'switching', 'connected', 'muted', 'background', 'interrupted'].includes(voicePhase);
     el('start-voice').hidden = inVoice;
     el('start-voice').disabled = authExpired || sessionBusy || voiceStartPending || voiceStopPending || (state.voiceActive && !peer);
     el('live-controls').hidden = !inVoice;
@@ -298,7 +301,8 @@ if (new URLSearchParams(location.hash.slice(1)).has('pair')) {
     el('cwd').disabled = el('new-session').disabled;
     el('effort').disabled = el('new-session').disabled;
     el('permission-mode').disabled = el('new-session').disabled;
-    el('voice').disabled = authExpired || !availableVoices.length || sessionBusy || inVoice || voiceStartPending || voiceStopPending || Boolean(state.voiceActive);
+    const canSwitchVoice = state.voiceSwitchSupported && peer && ['connected', 'muted'].includes(voicePhase);
+    el('voice').disabled = authExpired || !availableVoices.length || sessionBusy || voiceSwitchPending || voiceStartPending || voiceStopPending || ((inVoice || state.voiceActive) && !canSwitchVoice);
     el('yolo-active').hidden = !(state.threadId && state.permissionMode === 'yolo');
     el('send-text').disabled = authExpired || textBusy || sessionBusy;
     el('interrupt').disabled = authExpired || !state.activeTurnId;
@@ -312,6 +316,7 @@ if (new URLSearchParams(location.hash.slice(1)).has('pair')) {
     const labels = {
       idle: ['Bereit, wenn du es bist.', 'Das Mikrofon ist aus.'],
       connecting: ['Gespräch wird verbunden …', 'Die Sprachverbindung startet.'],
+      switching: ['Changing voice…', 'Audio is briefly paused. Your Codex session stays open.'],
       connected: ['Ich höre zu.', 'Du kannst einfach lossprechen.'],
       muted: ['Mikrofon pausiert.', `You can still hear ${assistantName()}.`],
       background: ['Gespräch im Hintergrund.', 'Der Browser kann Mikrofon und Ton im Hintergrund pausieren.'],
@@ -362,7 +367,7 @@ if (new URLSearchParams(location.hash.slice(1)).has('pair')) {
       void audio.play().catch(() => {});
     }
     const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-    if (!preparedAudioContext && AudioContextClass && !reducedMotion.matches) {
+    if (!preparedAudioContext && !micMeter && AudioContextClass && !reducedMotion.matches) {
       try {
         preparedAudioContext = new AudioContextClass();
         void preparedAudioContext.resume().catch(() => {});
@@ -498,32 +503,74 @@ if (new URLSearchParams(location.hash.slice(1)).has('pair')) {
     else if (microphone && !muted) startMicMeter(microphone);
   });
 
-  function releaseAudio() {
+  function releaseAudio({ keepMicrophone = false } = {}) {
     clearTimeout(disconnectTimer);
     disconnectTimer = null;
-    if (preparedAudioContext) { void preparedAudioContext.close().catch(() => {}); preparedAudioContext = null; }
-    stopMicMeter();
+    if (!keepMicrophone) {
+      voiceCloseWaiter?.();
+      if (preparedAudioContext) { void preparedAudioContext.close().catch(() => {}); preparedAudioContext = null; }
+      stopMicMeter();
+    }
     if (channel) { try { channel.close(); } catch {} channel = null; }
     if (peer) { peer.onconnectionstatechange = null; peer.ontrack = null; peer.close(); peer = null; }
-    if (microphone) { microphone.getTracks().forEach((track) => { track.onmute = track.onunmute = track.onended = null; track.stop(); }); microphone = null; }
+    if (microphone && !keepMicrophone) { microphone.getTracks().forEach((track) => { track.onmute = track.onunmute = track.onended = null; track.stop(); }); microphone = null; }
     const audio = el('remote-audio');
-    audio.pause();
-    audio.srcObject = null;
-    audio.removeAttribute('src');
-    if (audioUnlockUrl) { URL.revokeObjectURL(audioUnlockUrl); audioUnlockUrl = null; }
+    if (!keepMicrophone) {
+      audio.pause();
+      audio.srcObject = null;
+      audio.removeAttribute('src');
+      if (audioUnlockUrl) { URL.revokeObjectURL(audioUnlockUrl); audioUnlockUrl = null; }
+      muted = false;
+    }
     el('enable-audio').hidden = true;
-    muted = false;
     void updateWakeLock();
   }
 
   async function stopVoice({ reportError = true, phase = 'idle' } = {}) {
     voiceGeneration += 1;
+    voiceCloseWaiter?.();
     voiceStopPending = true;
     releaseAudio();
     setVoicePhase(phase);
     try { await api('/api/voice/stop', {}); state.voiceActive = false; }
     catch (error) { if (reportError) notice(`Mikrofon ist aus. Die serverseitige Sprachsitzung konnte nicht bestätigt beendet werden: ${error.message}`); }
     finally { await flushMemoryBeforeTransition(); voiceStopPending = false; renderControls(); }
+  }
+
+  async function switchVoice() {
+    if (!state.voiceSwitchSupported || voiceSwitchPending || voiceStartPending || voiceStopPending || !peer || !microphone || authExpired || pageHidden) return;
+    voiceSwitchPending = true;
+    const generation = ++voiceGeneration;
+    clearNotice();
+    // Preserve Safari's audio permission and the existing (possibly muted) mic.
+    void el('remote-audio').play().catch(() => {});
+    prepareAudioGesture();
+    releaseAudio({ keepMicrophone: true });
+    setVoicePhase('switching');
+    let timer;
+    const closed = new Promise((resolve, reject) => {
+      voiceCloseWaiter = () => { clearTimeout(timer); voiceCloseWaiter = null; resolve(); };
+      timer = setTimeout(() => reject(new Error('The previous voice connection did not finish closing. Please start voice again.')), 15000);
+    });
+    try {
+      // The close event can arrive after the HTTP response. Waiting for both
+      // prevents an old close notification from shutting down the new peer.
+      await Promise.all([api('/api/voice/stop', {}), closed]);
+      if (generation !== voiceGeneration || authExpired || pageHidden) return;
+      state.voiceActive = false;
+      await flushMemoryBeforeTransition();
+      if (generation !== voiceGeneration || authExpired || pageHidden) return;
+      await startVoice({ reuseMicrophone: true });
+    } catch (error) {
+      if (generation !== voiceGeneration || authExpired || pageHidden) return;
+      await stopVoice({ reportError: false, phase: 'error' });
+      notice(`Could not change voice. ${error.message}`);
+    } finally {
+      clearTimeout(timer);
+      voiceCloseWaiter?.();
+      voiceSwitchPending = false;
+      renderControls();
+    }
   }
 
   function realtimeEvent(event) {
@@ -564,7 +611,7 @@ if (new URLSearchParams(location.hash.slice(1)).has('pair')) {
     }
   }
 
-  async function startVoice() {
+  async function startVoice({ reuseMicrophone = false } = {}) {
     if (authExpired || voiceStartPending || voiceStopPending || peer) return;
     clearNotice();
     voiceStartPending = true;
@@ -572,17 +619,19 @@ if (new URLSearchParams(location.hash.slice(1)).has('pair')) {
     // selections retained by an older running backend after a failed start.
     const selectedVoice = availableVoices.length ? el('voice').value : undefined;
     const generation = ++voiceGeneration;
-    setVoicePhase('connecting');
+    setVoicePhase(reuseMicrophone ? 'switching' : 'connecting');
     try {
       if (!window.isSecureContext) throw new Error('Das Mikrofon braucht eine sichere Verbindung. Öffne auf dem iPhone den HTTPS-Link zu deinem Mac in Safari. Eine lokale HTTP-IP-Adresse reicht dafür nicht.');
       if (!navigator.mediaDevices?.getUserMedia || !window.RTCPeerConnection) throw new Error('Dieser Browser unterstützt keine Sprachverbindung. Öffne diese Seite direkt in einem aktuellen Safari oder Chrome.');
       prepareAudioGesture();
       if (!state.threadId) await createSession();
       if (generation !== voiceGeneration) return;
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+      const stream = reuseMicrophone ? microphone
+        : await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+      if (!stream || !stream.getAudioTracks().length || stream.getAudioTracks().some((track) => track.readyState === 'ended')) throw new Error('The microphone is no longer available. Please start voice again.');
       if (generation !== voiceGeneration) { stream.getTracks().forEach((track) => track.stop()); return; }
       microphone = stream;
-      startMicMeter(stream);
+      if (!muted && !micMeter) startMicMeter(stream);
       stream.getAudioTracks().forEach((track) => {
         track.onmute = () => {
           if (generation !== voiceGeneration || muted) return;
@@ -816,6 +865,7 @@ if (new URLSearchParams(location.hash.slice(1)).has('pair')) {
       void stopVoice({ reportError: false, phase: 'error' });
     } else if (method === 'thread/realtime/stopped' || method === 'thread/realtime/closed') {
       state.voiceActive = false;
+      if (voiceCloseWaiter) { voiceCloseWaiter(); return; }
       if (peer) { voiceGeneration += 1; releaseAudio(); setVoicePhase('idle'); }
     } else if (method === 'client/notice') notice(params.message || 'Bitte prüfe den lokalen Codex-Dienst.');
     else if (method === 'error') notice(params.error?.message || params.message || 'Codex hat einen Fehler gemeldet.');

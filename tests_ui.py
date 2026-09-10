@@ -70,8 +70,8 @@ Object.defineProperty(navigator.mediaDevices, 'getUserMedia', {value: async () =
   return destination.stream;
 }});
 window.RTCPeerConnection = class {
-  constructor() { this.connectionState = 'new'; uiFixture.peers.push(this); }
-  addTrack() {}
+  constructor() { this.connectionState = 'new'; this.tracks = []; uiFixture.peers.push(this); }
+  addTrack(track, stream) { this.tracks.push({track, stream}); }
   createDataChannel() {
     const channel = new EventTarget(); channel.readyState = 'open';
     channel.close = () => { channel.readyState = 'closed'; };
@@ -100,10 +100,14 @@ class FixtureServer(ThreadingHTTPServer):
         self.sse_requests = 0
         self.memory_failures = 0
         self.memory_records = []
+        self.defer_voice_closed = False
+        self.voice_stop_failures = 0
+        self.voice_start_failures = 0
         self.state = {'threadId': None, 'cwd': cwd, 'model': 'gpt-6-astra',
                       'effort': 'high', 'permissionMode': 'ask', 'voiceActive': False,
                       'activeTurnId': None, 'assistantName': 'Jerry',
-                      'voice': 'default', 'voiceOptions': VOICE_OPTIONS}
+                      'voice': 'default', 'voiceOptions': VOICE_OPTIONS,
+                      'voiceSwitchSupported': True}
 
     def emit(self, method, params):
         with self.condition:
@@ -190,7 +194,9 @@ class FixtureHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         data = json.loads(self.rfile.read(int(self.headers.get('Content-Length', '0'))))
-        self.server.requests.append((self.path, data))
+        with self.server.condition:
+            self.server.requests.append((self.path, data))
+            self.server.condition.notify_all()
         if self.path == '/api/memory/transcript':
             with self.server.condition:
                 if self.server.memory_failures:
@@ -203,14 +209,213 @@ class FixtureHandler(BaseHTTPRequestHandler):
             self.server.state.update(data, threadId=f'ui-thread-{len(self.server.requests)}')
             self.server.emit('state', dict(self.server.state))
         elif self.path == '/api/voice/start':
+            if self.server.voice_start_failures:
+                self.server.voice_start_failures -= 1
+                return self.respond({'error': 'Synthetic voice start failure'}, status=503)
             self.server.state['voiceActive'] = True
             if 'voice' in data:
                 self.server.state['voice'] = data['voice']
             return self.respond({'sdp': 'v=0 ui-answer', 'threadId': self.server.state['threadId']})
         elif self.path == '/api/voice/stop':
+            if self.server.voice_stop_failures:
+                self.server.voice_stop_failures -= 1
+                return self.respond({'error': 'Synthetic voice stop failure'}, status=503)
             self.server.state['voiceActive'] = False
-            self.server.emit('thread/realtime/closed', {})
+            if not self.server.defer_voice_closed:
+                self.server.emit('thread/realtime/closed', {'threadId': self.server.state['threadId']})
         self.respond(dict(self.server.state))
+
+
+def check_live_voice_switching(browser, url, server):
+    """Exercise live voice replacement through the phone's polling transport."""
+    report = []
+    with server.condition:
+        server.events.clear()
+        server.state.update(threadId='ui-live-switch', activeTurnId='ongoing-codex-work',
+                            voice='juniper', voiceOptions=VOICE_OPTIONS, voiceActive=True,
+                            assistantName='Jerry', clientTransport='poll')
+    context = browser.new_context(viewport={'width': 390, 'height': 844})
+    page = context.new_page()
+    errors = []
+    page.on('pageerror', lambda error: errors.append(str(error)))
+    request_offset = len(server.requests)
+
+    def count(path):
+        return sum(request_path == path for request_path, _ in server.requests)
+
+    def begin_switch(voice):
+        starts = count('/api/voice/start')
+        stops = count('/api/voice/stop')
+        server.defer_voice_closed = True
+        page.locator('#voice').select_option(voice)
+        expect(page.locator('#voice-control')).to_have_attribute('data-phase', 'switching')
+        expect(page.locator('#voice')).to_be_disabled()
+        expect(page.locator('#mute-voice')).to_be_disabled()
+        expect(page.locator('#stop-voice')).to_be_visible()
+        expect(page.locator('#stop-voice')).to_be_enabled()
+        with server.condition:
+            assert server.condition.wait_for(lambda: count('/api/voice/stop') > stops, 3)
+        assert count('/api/voice/start') == starts
+        return starts
+
+    def release_old_voice():
+        server.defer_voice_closed = False
+        server.emit('thread/realtime/closed', {'threadId': server.state['threadId']})
+
+    def assert_no_media_leaks():
+        assert page.evaluate('uiFixture.tracks.every(track => track.readyState === "ended")')
+        assert page.evaluate('uiFixture.peers.every(peer => peer.connectionState === "closed")')
+
+    def drain_events():
+        server.emit('client/notice', {'message': 'Fixture event delivery marker.'})
+        expect(page.locator('#notice-text')).to_have_text('Fixture event delivery marker.')
+
+    try:
+        server.state.pop('voiceSwitchSupported')
+        server.state['voiceActive'] = False
+        legacy_context = browser.new_context()
+        try:
+            legacy = legacy_context.new_page()
+            legacy.goto(url)
+            expect(legacy.locator('#start-voice')).to_be_enabled()
+            legacy.locator('#start-voice').click()
+            expect(legacy.locator('#voice-control')).to_have_attribute('data-phase', 'connected')
+            expect(legacy.locator('#voice')).to_be_disabled()
+            legacy.locator('#mute-voice').click()
+            expect(legacy.locator('#voice-control')).to_have_attribute('data-phase', 'muted')
+            expect(legacy.locator('#voice')).to_be_disabled()
+            legacy.locator('#stop-voice').click()
+            expect(legacy.locator('#voice')).to_be_enabled()
+        finally:
+            legacy_context.close()
+        server.state.update(voiceSwitchSupported=True, voiceActive=True)
+        report.append('servers without safe voice-switch support keep selection locked while their voice connection is active')
+
+        page.goto(url)
+        expect(page.locator('#connection-status')).to_contain_text('Mit deinem Mac verbunden')
+        expect(page.locator('#voice')).to_be_disabled()
+        expect(page.locator('#start-voice')).to_be_disabled()
+        server.state['voiceActive'] = False
+        server.emit('state', dict(server.state))
+        expect(page.locator('#start-voice')).to_be_enabled()
+        page.locator('#start-voice').click()
+        expect(page.locator('#voice-control')).to_have_attribute('data-phase', 'connected')
+        expect(page.locator('#voice')).to_be_enabled()
+        assert page.evaluate('uiFixture.micCalls') == 1
+
+        starts = begin_switch('cove')
+        assert page.evaluate('uiFixture.tracks[0].readyState') == 'live'
+        release_old_voice()
+        expect(page.locator('#voice-control')).to_have_attribute('data-phase', 'connected')
+        expect(page.locator('#voice')).to_be_enabled()
+        assert count('/api/voice/start') == starts + 1
+        assert server.state['voice'] == 'cove'
+        assert page.evaluate('uiFixture.micCalls') == 1
+        assert page.evaluate('uiFixture.peers[1].tracks[0].stream === uiFixture.peers[0].tracks[0].stream')
+        assert page.evaluate('uiFixture.peers[1].tracks[0].track === uiFixture.peers[0].tracks[0].track')
+        assert page.evaluate('uiFixture.tracks[0].enabled') is True
+        assert page.evaluate('uiFixture.peers[0].connectionState') == 'closed'
+
+        page.locator('#mute-voice').click()
+        expect(page.locator('#voice-control')).to_have_attribute('data-phase', 'muted')
+        expect(page.locator('#voice')).to_be_enabled()
+        starts = begin_switch('ember')
+        assert page.evaluate('uiFixture.tracks[0].enabled') is False
+        release_old_voice()
+        expect(page.locator('#voice-control')).to_have_attribute('data-phase', 'muted')
+        expect(page.locator('#voice')).to_be_enabled()
+        expect(page.locator('#mute-voice')).to_have_attribute('aria-pressed', 'true')
+        assert count('/api/voice/start') == starts + 1
+        assert page.evaluate('uiFixture.micCalls') == 1
+        assert page.evaluate('uiFixture.tracks[0].enabled') is False
+        assert page.evaluate('uiFixture.peers[2].tracks[0].stream === uiFixture.peers[0].tracks[0].stream')
+        assert server.state['threadId'] == 'ui-live-switch'
+        assert server.state['activeTurnId'] == 'ongoing-codex-work'
+        expect(page.locator('#work-status')).to_have_text('Jerry is working')
+        report.append('live voice replacement waits for the previous close event, reuses the microphone stream, preserves mute, and leaves active Codex work intact')
+
+        starts = begin_switch('maple')
+        page.locator('#stop-voice').click()
+        page.wait_for_function('uiFixture.tracks.every(track => track.readyState === "ended")')
+        release_old_voice()
+        drain_events()
+        expect(page.locator('#start-voice')).to_be_enabled()
+        assert count('/api/voice/start') == starts
+        assert_no_media_leaks()
+        report.append('Stop remains available during switching and cancels the pending restart without leaking microphone tracks')
+
+        page.locator('#start-voice').click()
+        expect(page.locator('#voice-control')).to_have_attribute('data-phase', 'connected')
+        starts = count('/api/voice/start')
+        server.voice_stop_failures = 1
+        page.locator('#voice').select_option('breeze')
+        expect(page.locator('#voice-control')).to_have_attribute('data-phase', 'error')
+        expect(page.locator('#notice')).to_be_visible()
+        assert count('/api/voice/start') == starts
+        assert_no_media_leaks()
+        server.state['voiceActive'] = False
+        server.emit('state', dict(server.state))
+        drain_events()
+        expect(page.locator('#start-voice')).to_be_enabled()
+
+        page.locator('#start-voice').click()
+        expect(page.locator('#voice-control')).to_have_attribute('data-phase', 'connected')
+        starts = begin_switch('arbor')
+        expect(page.locator('#voice-control')).to_have_attribute('data-phase', 'error', timeout=25000)
+        expect(page.locator('#notice')).to_be_visible()
+        assert count('/api/voice/start') == starts
+        assert_no_media_leaks()
+        release_old_voice()
+        drain_events()
+        expect(page.locator('#start-voice')).to_be_enabled()
+        report.append('failed stop requests and missing close confirmations cancel voice replacement, report the error, and close local media')
+
+        page.locator('#start-voice').click()
+        expect(page.locator('#voice-control')).to_have_attribute('data-phase', 'connected')
+        microphones = page.evaluate('uiFixture.micCalls')
+        starts = count('/api/voice/start')
+        server.voice_start_failures = 1
+        page.locator('#voice').select_option('vale')
+        expect(page.locator('#voice-control')).to_have_attribute('data-phase', 'error')
+        expect(page.locator('#notice')).to_be_visible()
+        expect(page.locator('#start-voice')).to_be_enabled()
+        assert count('/api/voice/start') == starts + 1
+        assert page.evaluate('uiFixture.micCalls') == microphones
+        assert_no_media_leaks()
+        drain_events()
+        page.locator('#start-voice').click()
+        expect(page.locator('#voice-control')).to_have_attribute('data-phase', 'connected')
+        assert page.evaluate('uiFixture.micCalls') == microphones + 1
+        report.append('a failed replacement start releases the retained microphone and allows an explicit retry')
+
+        starts = begin_switch('sol')
+        page.evaluate("window.dispatchEvent(new Event('pagehide'))")
+        expect(page.locator('#voice-control')).to_have_attribute('data-phase', 'error')
+        assert_no_media_leaks()
+        release_old_voice()
+        page.evaluate("window.dispatchEvent(new PageTransitionEvent('pageshow', {persisted:true}))")
+        drain_events()
+        expect(page.locator('#start-voice')).to_be_enabled()
+        assert count('/api/voice/start') == starts
+        assert_no_media_leaks()
+        paths = [path for path, _ in server.requests[request_offset:]]
+        assert '/api/session' not in paths
+        assert '/api/interrupt' not in paths
+        assert server.state['threadId'] == 'ui-live-switch'
+        assert server.state['activeTurnId'] == 'ongoing-codex-work'
+        assert not errors, errors
+        report.append('pagehide cancels an in-flight voice replacement; returning does not reopen the microphone or replace the active Codex task')
+        return report
+    finally:
+        context.close()
+        server.defer_voice_closed = False
+        server.voice_stop_failures = 0
+        server.voice_start_failures = 0
+        with server.condition:
+            server.events.clear()
+            server.poll_requests.clear()
+            server.state.update(threadId=None, activeTurnId=None, voice='default', voiceActive=False)
+            server.state.pop('clientTransport', None)
 
 
 def run():
@@ -272,10 +477,10 @@ def run():
                 expect(named.locator('#voice-control')).to_have_attribute('data-phase', 'connected')
                 assert last_voice_start()['voice'] == 'default'
                 original_thread = server.state['threadId']
-                expect(named.locator('#voice')).to_be_disabled()
+                expect(named.locator('#voice')).to_be_enabled()
                 named.locator('#mute-voice').click()
                 expect(named.locator('#voice-detail')).to_have_text('You can still hear Jerry.')
-                expect(named.locator('#voice')).to_be_disabled()
+                expect(named.locator('#voice')).to_be_enabled()
                 named.locator('#stop-voice').click()
                 expect(named.locator('#voice')).to_be_enabled()
                 named.locator('#voice').select_option('ember')
@@ -311,7 +516,7 @@ def run():
                     destination = Path(screenshot_dir)
                     destination.mkdir(parents=True, exist_ok=True)
                     named.screenshot(path=str(destination / 'voice-choice-mobile.png'), full_page=True)
-                report.append('voice choices preserve provider default, persist explicit selection, lock during connecting and active voice, and restart without creating another Codex thread')
+                report.append('voice choices preserve provider default, persist explicit selection, lock while connecting, and restart without creating another Codex thread')
 
                 server.state.update(voice='alloy', voiceOptions=LEGACY_VOICE_OPTIONS)
                 named.evaluate("localStorage.setItem('codex-voice.voice', 'alloy')")
@@ -371,6 +576,8 @@ def run():
                 named_context.close()
                 server.state.update(threadId=None, voice='default', voiceActive=False)
                 report.append('older servers hide voice settings and receive no voice override; invalid saved voices fall back to the server choice')
+
+                report.extend(check_live_voice_switching(browser, url, server))
 
                 server.state['permissionMode'] = 'yolo'
                 fresh_context = browser.new_context()

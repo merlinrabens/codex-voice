@@ -134,6 +134,12 @@ class RemoteAccess:
 class Codex:
     memory_index_retry_seconds = 1.0
     memory_index_coalesce_seconds = 0.15
+    voice_history_max_threads = 8
+    voice_history_max_items = 127
+    voice_history_max_bytes = 24 * 1024
+    # Leave room below V3's 128-item / 8,192 estimated-token startup limit.
+    # Count UTF-8 JSON bytes, plus per-item overhead, before building the request.
+    voice_initial_max_bytes = 28 * 1024
 
     def __init__(self, cwd, model='gpt-6-astra', permission_mode='ask', memory=None, memory_index_command=None,
                  assistant=None, voice='default'):
@@ -168,12 +174,15 @@ class Codex:
         self.memory_failed = []
         self.memory_thread = None
         self.known_threads = {}
+        self.voice_history = collections.OrderedDict()
+        self.voice_history_sequence = 0
         self.state = {'threadId': None, 'cwd': str(Path(cwd).expanduser().resolve()),
                       'model': model, 'effort': 'high', 'voiceActive': False,
                       'permissionMode': permission_mode,
                       'assistantName': self.assistant['name'],
                       'assistantAge': self.assistant.get('persona_age'),
                       'voice': voice, 'voiceOptions': list(VOICE_OPTIONS),
+                      'voiceSwitchSupported': True,
                       'activeTurnId': None, 'voiceStatus': 'idle'}
         if memory:
             self.state.update(memoryEnabled=True, memoryServerTranscripts=True, memoryStatus='ready')
@@ -235,6 +244,57 @@ class Codex:
     def snapshot(self):
         with self.condition:
             return dict(self.state)
+
+    @staticmethod
+    def voice_item_bytes(item):
+        return len(json.dumps(item, ensure_ascii=False).encode('utf-8')) + 64
+
+    def retain_voice_transcript(self, thread_id, role, text, item_id=None):
+        """Keep recent final speech for reconnects, separately from opt-in archives."""
+        if (not isinstance(thread_id, str) or thread_id not in self.known_threads
+                or role not in ('user', 'assistant') or not isinstance(text, str) or not text.strip()):
+            return
+        item = {'role': role, 'text': text}
+        try:
+            size = self.voice_item_bytes(item)
+        except UnicodeError:
+            return
+        with self.condition:
+            self.voice_history_sequence += 1
+            key = (role, hashlib.sha256(item_id.encode('utf-8', errors='replace')).hexdigest()) \
+                if isinstance(item_id, str) and item_id else ('sequence', self.voice_history_sequence)
+            history = self.voice_history.get(thread_id)
+            if size > self.voice_history_max_bytes:
+                # Do not retain a stale earlier revision of an oversized final item.
+                if history is not None:
+                    history.pop(key, None)
+                return
+            if history is None:
+                history = self.voice_history[thread_id] = collections.OrderedDict()
+            history[key] = item
+            self.voice_history.move_to_end(thread_id)
+            while (len(history) > self.voice_history_max_items
+                   or sum(self.voice_item_bytes(value) for value in history.values()) > self.voice_history_max_bytes):
+                history.popitem(last=False)
+            while len(self.voice_history) > self.voice_history_max_threads:
+                self.voice_history.popitem(last=False)
+
+    def voice_initial_items(self, thread_id):
+        """Replay only this thread's speech, with original roles and no tool output."""
+        persona = {'role': 'developer', 'text': self.persona_instructions}
+        remaining = self.voice_initial_max_bytes - self.voice_item_bytes(persona)
+        recent = []
+        with self.condition:
+            history = self.voice_history.get(thread_id, {}) if thread_id in self.known_threads else {}
+            for item in reversed(list(history.values())):
+                size = self.voice_item_bytes(item)
+                if size > remaining:
+                    break
+                recent.append(dict(item))
+                remaining -= size
+                if len(recent) >= self.voice_history_max_items:
+                    break
+        return [persona, *reversed(recent)]
 
     def memory_worker(self):
         while True:
@@ -399,6 +459,8 @@ class Codex:
                 source_thread = params.get('threadId')
                 if method == 'thread/realtime/transcript/done':
                     if source_thread in self.known_threads:
+                        self.retain_voice_transcript(source_thread, params.get('role'), params.get('text'),
+                                                     params.get('itemId') or params.get('item_id'))
                         self.capture(params.get('role'), params.get('text'),
                                      params.get('itemId') or f'voice-{time.time_ns()}', source_thread)
                 elif method == 'item/completed' and (params.get('item') or {}).get('type') == 'agentMessage':
@@ -502,7 +564,7 @@ class Codex:
             try:
                 params = {'threadId': ident, 'outputModality': 'audio', 'version': 'v3',
                           'transport': {'type': 'webrtc', 'sdp': sdp},
-                          'initialItems': [{'role': 'developer', 'text': self.persona_instructions}],
+                          'initialItems': self.voice_initial_items(ident),
                           'realtimeStartInstructions': self.persona_instructions}
                 if selected_voice != 'default':
                     params['voice'] = selected_voice

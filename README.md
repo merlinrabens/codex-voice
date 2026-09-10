@@ -47,7 +47,11 @@ The same option works with `remote.py`. The public default name is Astra. Option
 
 The optional age describes an AI persona, not a human biography. A profile changes assistant instructions; it does not grant tools, add background scheduling, or configure a knowledge source.
 
-Use the **Voice** selector before starting voice. **Provider default · keep current voice** leaves the provider's original voice choice in place. The browser keeps an explicit selection for later visits to the same origin. End voice, choose another voice, then start again to try it; your Codex session and task context stay open. Changing the voice does not change the assistant's name or model.
+Use the **Voice** selector before or during a conversation. **Provider default · keep current voice** leaves the provider's original voice choice in place. The browser keeps an explicit selection for later visits to the same origin. During a conversation, choosing another voice briefly pauses audio while the connection restarts. Your Codex thread and running task stay open, the recent finalized voice conversation is carried over, and a muted microphone stays muted. Switch between sentences: audio in progress can be cut off. Changing the voice does not change the assistant's name or model.
+
+The current Codex app-server exposes voice selection at connection startup, so this client reconnects on the same thread rather than changing an active audio stream in place. It reuses the approved microphone stream, waits for the previous connection to close, and replays a bounded recent transcript with its original user/assistant roles. Stop or leaving the page cancels the switch. Older servers without this continuity support keep the selector locked while voice is active.
+
+Conversation carryover keeps up to 127 finalized messages and 24 KiB of counted data per thread in server memory, for up to eight threads. Startup replay reserves space for the assistant profile and drops the oldest whole messages to fit the V3 limit. It does not preserve unfinished speech or an unlimited conversation history; optional durable conversation archives are separate.
 
 Unsupported saved choices are cleared with an explanation. The selector uses a supported server choice or the provider default and sends that displayed selection when you start voice. This also recovers an older running server that retained an unsupported choice after a failed connection, without restarting the server or tunnel.
 
