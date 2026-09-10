@@ -19,9 +19,15 @@ from http.cookies import SimpleCookie, CookieError
 from urllib.parse import urlsplit, parse_qs
 from memory import VoiceMemory
 from control import LocalPairingControl, write_private_json
+from persona import load_persona, persona_instructions
 
 ROOT = Path(__file__).resolve().parent
 EFFORTS = {'low', 'medium', 'high', 'xhigh', 'ultra'}
+# RealtimeVoice from the installed Codex 0.153.4 experimental protocol schema.
+# Protocol support does not guarantee availability for every account/backend.
+VOICE_OPTIONS = ('alloy', 'arbor', 'ash', 'ballad', 'breeze', 'cedar', 'coral',
+                 'cove', 'echo', 'ember', 'juniper', 'maple', 'marin', 'sage',
+                 'shimmer', 'sol', 'spruce', 'vale', 'verse')
 PERMISSION_MODES = {
     'ask': {'approvalPolicy': 'on-request', 'sandbox': 'workspace-write'},
     'yolo': {'approvalPolicy': 'never', 'sandbox': 'danger-full-access'},
@@ -130,9 +136,14 @@ class Codex:
     memory_index_retry_seconds = 1.0
     memory_index_coalesce_seconds = 0.15
 
-    def __init__(self, cwd, model='gpt-6-astra', permission_mode='ask', memory=None, memory_index_command=None):
+    def __init__(self, cwd, model='gpt-6-astra', permission_mode='ask', memory=None, memory_index_command=None,
+                 assistant=None, voice='default'):
         if permission_mode not in PERMISSION_MODES:
             raise RequestError('Unbekannter Freigabemodus.')
+        if not isinstance(voice, str) or voice not in ('default', *VOICE_OPTIONS):
+            raise RequestError('Unknown voice selection.')
+        self.assistant = assistant if assistant is not None else load_persona()
+        self.persona_instructions = persona_instructions(self.assistant)
         self.default_permission_mode = permission_mode
         self.condition = threading.Condition(threading.RLock())
         self.write_lock = threading.Lock()
@@ -161,6 +172,9 @@ class Codex:
         self.state = {'threadId': None, 'cwd': str(Path(cwd).expanduser().resolve()),
                       'model': model, 'effort': 'high', 'voiceActive': False,
                       'permissionMode': permission_mode,
+                      'assistantName': self.assistant['name'],
+                      'assistantAge': self.assistant.get('persona_age'),
+                      'voice': voice, 'voiceOptions': list(VOICE_OPTIONS),
                       'activeTurnId': None, 'voiceStatus': 'idle'}
         if memory:
             self.state.update(memoryEnabled=True, memoryServerTranscripts=True, memoryStatus='ready')
@@ -450,7 +464,7 @@ class Codex:
                 raise RequestError('Bitte zuerst die offene Freigabe beantworten.')
             params = {'cwd': str(cwd), 'model': self.state['model'], **PERMISSION_MODES[permission_mode],
                       'config': {'model_reasoning_effort': effort},
-                      'developerInstructions': COMPUTER_USE_INSTRUCTIONS}
+                      'developerInstructions': COMPUTER_USE_INSTRUCTIONS + '\n\n' + self.persona_instructions}
             thread_id = data.get('threadId')
             if thread_id:
                 params.update(threadId=str(thread_id), excludeTurns=True)
@@ -476,16 +490,24 @@ class Codex:
         sdp = data.get('sdp')
         if not isinstance(sdp, str) or not sdp.startswith('v=0') or len(sdp) > 100000:
             raise RequestError('Ungültiges Verbindungsangebot.')
+        selected_voice = data.get('voice', self.state.get('voice', 'default'))
+        if not isinstance(selected_voice, str) or selected_voice not in ('default', *VOICE_OPTIONS):
+            raise RequestError('Unknown voice selection. Choose a listed voice or the provider default.')
         with self.session_lock:
             ident = self.require_thread()
             if self.state['voiceActive']:
                 raise RequestError('Eine Sprachverbindung ist bereits aktiv.')
             with self.condition:
                 self.answer = self.voice_error = None
-                self.state.update(voiceActive=True, voiceStatus='connecting')
+                self.state.update(voiceActive=True, voiceStatus='connecting', voice=selected_voice)
             try:
-                self.rpc('thread/realtime/start', {'threadId': ident, 'outputModality': 'audio', 'version': 'v3',
-                         'transport': {'type': 'webrtc', 'sdp': sdp}})
+                params = {'threadId': ident, 'outputModality': 'audio', 'version': 'v3',
+                          'transport': {'type': 'webrtc', 'sdp': sdp},
+                          'initialItems': [{'role': 'developer', 'text': self.persona_instructions}],
+                          'realtimeStartInstructions': self.persona_instructions}
+                if selected_voice != 'default':
+                    params['voice'] = selected_voice
+                self.rpc('thread/realtime/start', params)
                 with self.condition:
                     ready = self.condition.wait_for(lambda: self.answer or self.voice_error or self.closed, 45)
                     answer, error = self.answer, self.voice_error
@@ -776,6 +798,9 @@ def main():
     parser.add_argument('--port', type=int, default=8766)
     parser.add_argument('--cwd', default=str(Path.cwd()))
     parser.add_argument('--model', default='gpt-6-astra', help='Codex model for tasks (voice uses its own model)')
+    parser.add_argument('--assistant-name', help='Assistant display and conversational name')
+    parser.add_argument('--assistant-profile', help='Optional private JSON persona file outside this checkout')
+    parser.add_argument('--voice', default='default', choices=('default', *VOICE_OPTIONS), help='Initial Realtime voice selection')
     parser.add_argument('--yolo', action='store_true', help='Default new sessions to full access without approval prompts')
     parser.add_argument('--remote-origin', help='Exact HTTPS tunnel origin; enables pairing on every route')
     parser.add_argument('--pairing-file', help='Private connection receipt outside the source checkout')
@@ -785,6 +810,7 @@ def main():
     args = parser.parse_args()
     if bool(args.remote_origin) != bool(args.pairing_file):
         parser.error('--remote-origin and --pairing-file must be used together')
+    assistant = load_persona(args.assistant_profile, args.assistant_name)
     server = ThreadingHTTPServer(('127.0.0.1', args.port), Handler)
     server.daemon_threads = True
     if args.remote_origin:
@@ -793,7 +819,7 @@ def main():
         memory = VoiceMemory(args.memory_dir) if args.memory_dir else None
         index_command = [args.memory_index_python, str(Path(args.memory_index_script).expanduser().resolve())] if args.memory_index_script else None
         codex = Codex(args.cwd, model=args.model, permission_mode='yolo' if args.yolo else 'ask',
-                      memory=memory, memory_index_command=index_command)
+                      memory=memory, memory_index_command=index_command, assistant=assistant, voice=args.voice)
     except Exception:
         server.server_close()
         raise

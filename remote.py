@@ -14,6 +14,7 @@ import sys
 import threading
 import time
 from control import request_pairing
+from persona import load_persona
 
 ROOT = Path(__file__).resolve().parent
 
@@ -23,6 +24,9 @@ def main():
     parser.add_argument('--cwd', default=str(Path.cwd()))
     parser.add_argument('--port', type=int, default=8766)
     parser.add_argument('--model', default='gpt-6-astra')
+    parser.add_argument('--assistant-name', help='Assistant display and conversational name')
+    parser.add_argument('--assistant-profile', help='Optional private JSON persona file outside this checkout')
+    parser.add_argument('--voice', default='default', help='Initial Realtime voice selection; default preserves the provider choice')
     parser.add_argument('--yolo', action='store_true')
     parser.add_argument('--keep-awake', action='store_true')
     parser.add_argument('--memory-dir', help='Private conversation archive directory')
@@ -49,6 +53,7 @@ def main():
         return
     if not shutil.which('cloudflared'):
         parser.error('Install cloudflared before using remote access.')
+    load_persona(args.assistant_profile, args.assistant_name)
     if not Path(args.cwd).expanduser().is_dir():
         parser.error('The project directory does not exist.')
     with socket.socket() as probe:
@@ -80,7 +85,11 @@ def main():
         if not origin:
             raise RuntimeError('The HTTPS tunnel could not start.')
         command = [sys.executable, str(ROOT / 'server.py'), '--port', str(args.port), '--cwd', args.cwd,
-                   '--model', args.model, '--remote-origin', origin, '--pairing-file', str(receipt)]
+                   '--model', args.model, '--voice', args.voice, '--remote-origin', origin, '--pairing-file', str(receipt)]
+        if args.assistant_name:
+            command.extend(['--assistant-name', args.assistant_name])
+        if args.assistant_profile:
+            command.extend(['--assistant-profile', str(Path(args.assistant_profile).expanduser().resolve())])
         if args.yolo:
             command.append('--yolo')
         if args.memory_dir:

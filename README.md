@@ -27,6 +27,30 @@ Open [http://127.0.0.1:8766](http://127.0.0.1:8766), choose your project folder 
 
 Use `--port 8767` to choose another port or `--model MODEL_ID` to select a different task model. Without `--cwd`, the working directory is where you launched the command.
 
+### Assistant name and voice
+
+Give your assistant a name with `--assistant-name`. The name appears in the interface and is included in the instructions for both voice and Codex work. It does not change the task model:
+
+```sh
+python3 server.py --cwd /path/to/your/project --assistant-name Jerry
+```
+
+The same option works with `remote.py`. The public default name is Astra. Optional `--assistant-profile /path/to/private/profile.json` supplies a local assistant profile; keep personal profiles outside this checkout. All profile fields are optional, and `--assistant-name` overrides the profile's name:
+
+```json
+{
+  "name": "Jerry",
+  "persona_age": 28,
+  "instructions": "Be concise, practical, and clear about what you have verified."
+}
+```
+
+The optional age describes an AI persona, not a human biography. A profile changes assistant instructions; it does not grant tools, add background scheduling, or configure a knowledge source.
+
+Use the **Voice** selector before starting voice. **Provider default · keep current voice** leaves the provider's original voice choice in place. The browser keeps an explicit selection for later visits to the same origin. End voice, choose another voice, then start again to try it; your Codex session and task context stay open. Changing the voice does not change the assistant's name or model.
+
+The Codex CLI `0.153.4` protocol lists these 19 named choices: Alloy, Arbor, Ash, Ballad, Breeze, Cedar, Coral, Cove, Echo, Ember, Juniper, Maple, Marin, Sage, Shimmer, Sol, Spruce, Vale, and Verse. Protocol support does not establish that every voice is available to every account; this project has not live-tested all 19. The selector follows the server's advertised options and stays hidden when connected to an older server without voice selection support.
+
 ### Optional command installation
 
 Keep this source directory in place. From the repository root:

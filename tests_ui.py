@@ -17,6 +17,9 @@ from playwright.sync_api import expect, sync_playwright
 
 
 ROOT = Path(__file__).resolve().parent
+VOICE_OPTIONS = ['alloy', 'arbor', 'ash', 'ballad', 'breeze', 'cedar', 'coral',
+                 'cove', 'echo', 'ember', 'juniper', 'maple', 'marin', 'sage',
+                 'shimmer', 'sol', 'spruce', 'vale', 'verse']
 BOOT = r"""
 window.uiFixture = {micCalls:0, contexts:[], inputContexts:[], tracks:[], peers:[], channels:[], storageWrites:[], speakerConnections:0, audioPlays:[], actions:[], wakeLocks:[], visibility:'visible'};
 const nativeFetch = window.fetch;
@@ -71,7 +74,7 @@ window.RTCPeerConnection = class {
     channel.close = () => { channel.readyState = 'closed'; };
     uiFixture.channels.push(channel); return channel;
   }
-  async createOffer() { return {type:'offer',sdp:'v=0 ui-test'}; }
+  async createOffer() { await uiFixture.offerGate; return {type:'offer',sdp:'v=0 ui-test'}; }
   async setLocalDescription(value) { this.localDescription = value; }
   async setRemoteDescription() { this.connectionState = 'connected'; this.onconnectionstatechange?.(); }
   close() { this.connectionState = 'closed'; }
@@ -96,7 +99,8 @@ class FixtureServer(ThreadingHTTPServer):
         self.memory_records = []
         self.state = {'threadId': None, 'cwd': cwd, 'model': 'gpt-6-astra',
                       'effort': 'high', 'permissionMode': 'ask', 'voiceActive': False,
-                      'activeTurnId': None}
+                      'activeTurnId': None, 'assistantName': 'Jerry',
+                      'voice': 'default', 'voiceOptions': VOICE_OPTIONS}
 
     def emit(self, method, params):
         with self.condition:
@@ -197,6 +201,8 @@ class FixtureHandler(BaseHTTPRequestHandler):
             self.server.emit('state', dict(self.server.state))
         elif self.path == '/api/voice/start':
             self.server.state['voiceActive'] = True
+            if 'voice' in data:
+                self.server.state['voice'] = data['voice']
             return self.respond({'sdp': 'v=0 ui-answer', 'threadId': self.server.state['threadId']})
         elif self.path == '/api/voice/stop':
             self.server.state['voiceActive'] = False
@@ -218,6 +224,118 @@ def run():
                     launch['executable_path'] = str(chrome)
                 browser = playwright.chromium.launch(**launch)
                 url = f'http://127.0.0.1:{server.server_port}'
+                named_context = browser.new_context(viewport={'width': 390, 'height': 844})
+                named = named_context.new_page()
+                named_errors = []
+                named.on('pageerror', lambda error: named_errors.append(str(error)))
+                named.goto(url)
+                expect(named.locator('#connection-status')).to_contain_text('Lokal verbunden')
+                expect(named).to_have_title('Jerry · Voice')
+                expect(named.locator('.wordmark')).to_have_attribute('aria-label', 'Jerry Voice home')
+                expect(named.locator('#message')).to_have_attribute('placeholder', 'Or write to Jerry…')
+                expect(named.locator('#interrupt')).to_have_text('Interrupt Jerry')
+                expect(named.locator('#voice-field')).to_be_visible()
+                expect(named.locator('#voice option')).to_have_count(20)
+                expect(named.locator('#voice')).to_have_value('default')
+                assert named.evaluate('document.documentElement.scrollWidth <= innerWidth')
+                assert named.locator('#voice').evaluate('element => getComputedStyle(element).fontSize') == '16px'
+                assert named.evaluate('uiFixture.micCalls') == 0
+                assert named.evaluate('uiFixture.storageWrites.length') == 0
+                server.emit('item/agentMessage/delta', {'itemId': 'name-test', 'delta': 'An assistant response.'})
+                expect(named.locator('[data-assistant-message]')).to_have_text('Jerry')
+                server.emit('approval/request', {'id': 'name-approval', 'params': {'command': 'git status'}})
+                expect(named.locator('.approval-card h3')).to_have_text('Jerry needs your approval')
+                injected_name = '<img src=x onerror="window.nameExecuted=true">'
+                server.state.update(assistantName=injected_name, activeTurnId='name-test-turn')
+                server.emit('state', dict(server.state))
+                expect(named).to_have_title(f'{injected_name} · Voice')
+                expect(named.locator('[data-assistant-message]')).to_have_text(injected_name)
+                expect(named.locator('.approval-card h3')).to_have_text(f'{injected_name} needs your approval')
+                expect(named.locator('img')).to_have_count(0)
+                assert named.evaluate('window.nameExecuted') is None
+                server.emit('serverRequest/resolved', {'requestId': 'name-approval'})
+                expect(named.locator('#work-status')).to_have_text(f'{injected_name} is working')
+                server.state.update(assistantName='Jerry', activeTurnId=None)
+                server.emit('state', dict(server.state))
+                expect(named).to_have_title('Jerry · Voice')
+                expect(named.locator('#model-label')).to_have_text('gpt-6-astra · high')
+                report.append('custom assistant name updates accessible labels, existing messages and approvals without executing markup or changing model IDs')
+
+                def last_voice_start():
+                    return [body for path, body in server.requests if path == '/api/voice/start'][-1]
+
+                sessions_before = len([path for path, _ in server.requests if path == '/api/session'])
+                named.locator('#start-voice').click()
+                expect(named.locator('#voice-control')).to_have_attribute('data-phase', 'connected')
+                assert 'voice' not in last_voice_start()
+                original_thread = server.state['threadId']
+                expect(named.locator('#voice')).to_be_disabled()
+                named.locator('#mute-voice').click()
+                expect(named.locator('#voice-detail')).to_have_text('You can still hear Jerry.')
+                expect(named.locator('#voice')).to_be_disabled()
+                named.locator('#stop-voice').click()
+                expect(named.locator('#voice')).to_be_enabled()
+                named.locator('#voice').select_option('cedar')
+                assert named.evaluate('uiFixture.storageWrites') == [{'key': 'codex-voice.voice', 'value': 'cedar'}]
+                named.evaluate('() => { uiFixture.offerGate = new Promise(resolve => { uiFixture.releaseOffer = resolve; }); }')
+                named.locator('#start-voice').click()
+                expect(named.locator('#voice-control')).to_have_attribute('data-phase', 'connecting')
+                expect(named.locator('#voice')).to_be_disabled()
+                named.evaluate('uiFixture.releaseOffer()')
+                expect(named.locator('#voice-control')).to_have_attribute('data-phase', 'connected')
+                assert last_voice_start()['voice'] == 'cedar'
+                assert server.state['threadId'] == original_thread
+                named.locator('#stop-voice').click()
+                expect(named.locator('#voice')).to_be_enabled()
+                named.locator('#voice').select_option('default')
+                named.locator('#start-voice').click()
+                expect(named.locator('#voice-control')).to_have_attribute('data-phase', 'connected')
+                assert last_voice_start()['voice'] == 'default'
+                assert server.state['threadId'] == original_thread
+                assert len([path for path, _ in server.requests if path == '/api/session']) == sessions_before + 1
+                assert all('voice' not in body for path, body in server.requests if path == '/api/session')
+                named.locator('#stop-voice').click()
+                expect(named.locator('#voice')).to_be_enabled()
+                named.reload()
+                expect(named.locator('#voice')).to_have_value('default')
+                named.locator('#voice').select_option('marin')
+                named.reload()
+                expect(named.locator('#voice')).to_have_value('marin')
+                assert named.evaluate('uiFixture.storageWrites.length') == 0
+                assert named.evaluate('uiFixture.micCalls') == 0
+                screenshot_dir = os.environ.get('CODEX_VOICE_UI_SCREENSHOTS')
+                if screenshot_dir:
+                    destination = Path(screenshot_dir)
+                    destination.mkdir(parents=True, exist_ok=True)
+                    named.screenshot(path=str(destination / 'voice-choice-mobile.png'), full_page=True)
+                report.append('voice choices preserve provider default, persist explicit selection, lock during connecting and active voice, and restart without creating another Codex thread')
+
+                server.state.pop('assistantName')
+                server.state.pop('voiceOptions')
+                server.state.pop('voice')
+                named.reload()
+                expect(named.locator('#connection-status')).to_contain_text('Lokal verbunden')
+                expect(named).to_have_title('Astra · Voice')
+                expect(named.locator('#voice-field')).to_be_hidden()
+                named.locator('#start-voice').click()
+                expect(named.locator('#voice-control')).to_have_attribute('data-phase', 'connected')
+                assert 'voice' not in last_voice_start()
+                named.locator('#stop-voice').click()
+                expect(named.locator('#start-voice')).to_be_enabled()
+                server.state.update(assistantName='Jerry', voice='ash', voiceOptions=VOICE_OPTIONS)
+                named.evaluate("localStorage.setItem('codex-voice.voice', 'unknown-voice')")
+                named.reload()
+                expect(named.locator('#voice')).to_have_value('ash')
+                named.locator('#start-voice').click()
+                expect(named.locator('#voice-control')).to_have_attribute('data-phase', 'connected')
+                assert 'voice' not in last_voice_start()
+                named.locator('#stop-voice').click()
+                expect(named.locator('#start-voice')).to_be_enabled()
+                assert not named_errors, named_errors
+                named_context.close()
+                server.state.update(threadId=None, voice='default', voiceActive=False)
+                report.append('older servers hide voice settings and receive no voice override; invalid saved voices fall back to the server choice')
+
                 server.state['permissionMode'] = 'yolo'
                 fresh_context = browser.new_context()
                 fresh_page = fresh_context.new_page()

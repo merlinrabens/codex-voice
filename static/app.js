@@ -8,7 +8,7 @@ if (new URLSearchParams(location.hash.slice(1)).has('pair')) {
 
 (() => {
   const el = (id) => document.getElementById(id);
-  const state = { threadId: null, cwd: '', model: 'gpt-6-astra', effort: 'high', permissionMode: 'ask', voiceActive: false, activeTurnId: null };
+  const state = { threadId: null, cwd: '', model: 'gpt-6-astra', assistantName: 'Astra', effort: 'high', permissionMode: 'ask', voiceActive: false, activeTurnId: null };
   const messages = new Map();
   const approvals = new Map();
   const toolItems = new Map();
@@ -46,7 +46,14 @@ if (new URLSearchParams(location.hash.slice(1)).has('pair')) {
   let memoryFailures = 0;
   let memoryError = false;
   const permissionStorageKey = 'codex-voice.permission-mode';
+  const voiceStorageKey = 'codex-voice.voice';
+  let savedVoiceChoice = null;
+  let voiceChoiceExplicit = false;
+  let availableVoices = [];
+  let voiceOptionsKey = null;
+  let renderedAssistantName = null;
   let permissionChoiceExplicit = false;
+  try { savedVoiceChoice = localStorage.getItem(voiceStorageKey); } catch { /* Voice selection also works without browser storage. */ }
   try {
     const savedMode = localStorage.getItem(permissionStorageKey);
     if (savedMode === 'ask' || savedMode === 'yolo') {
@@ -69,6 +76,54 @@ if (new URLSearchParams(location.hash.slice(1)).has('pair')) {
     renderPermissionChoice();
   });
   renderPermissionChoice();
+
+  function assistantName() {
+    return typeof state.assistantName === 'string' && state.assistantName.trim() ? state.assistantName.trim() : 'Astra';
+  }
+
+  function renderAssistantName() {
+    const name = assistantName();
+    if (renderedAssistantName === name) return;
+    renderedAssistantName = name;
+    document.title = `${name} · Voice`;
+    document.querySelectorAll('[data-assistant-name]').forEach((node) => { node.textContent = name; });
+    document.querySelector('.wordmark').setAttribute('aria-label', `${name} Voice home`);
+    el('message').placeholder = `Or write to ${name}…`;
+    document.querySelectorAll('[data-assistant-message]').forEach((node) => {
+      node.textContent = node.dataset.assistantMessage === 'voice' ? `${name} · Voice` : name;
+    });
+    document.querySelectorAll('[data-assistant-approval]').forEach((node) => { node.textContent = `${name} needs your approval`; });
+    if (voicePhase === 'muted') el('voice-detail').textContent = `You can still hear ${name}.`;
+  }
+
+  function renderVoiceChoice() {
+    availableVoices = Array.isArray(state.voiceOptions)
+      ? [...new Set(state.voiceOptions.filter((voice) => typeof voice === 'string' && /^[a-z][a-z0-9-]{0,31}$/.test(voice) && voice !== 'default'))]
+      : [];
+    el('voice-field').hidden = !availableVoices.length;
+    const key = JSON.stringify(availableVoices);
+    if (key !== voiceOptionsKey) {
+      voiceOptionsKey = key;
+      const previous = el('voice').value;
+      el('voice').replaceChildren(new Option('Provider default · keep current voice', 'default'));
+      for (const voice of availableVoices) el('voice').add(new Option(voice[0].toUpperCase() + voice.slice(1), voice));
+      if (voiceChoiceExplicit && (previous === 'default' || availableVoices.includes(previous))) el('voice').value = previous;
+      else voiceChoiceExplicit = false;
+    }
+    if (!voiceChoiceExplicit && availableVoices.length && (savedVoiceChoice === 'default' || availableVoices.includes(savedVoiceChoice))) {
+      el('voice').value = savedVoiceChoice;
+      voiceChoiceExplicit = true;
+    }
+    if (!voiceChoiceExplicit) el('voice').value = availableVoices.includes(state.voice) ? state.voice : 'default';
+  }
+
+  el('voice').addEventListener('change', () => {
+    const choice = el('voice').value;
+    if (!availableVoices.length || (choice !== 'default' && !availableVoices.includes(choice))) return;
+    voiceChoiceExplicit = true;
+    savedVoiceChoice = choice;
+    try { localStorage.setItem(voiceStorageKey, choice); } catch { /* Keep this page's explicit choice. */ }
+  });
 
   async function api(path, body, { signal, timeout = 65000 } = {}) {
     const options = { headers: { 'Content-Type': 'application/json' } };
@@ -119,6 +174,8 @@ if (new URLSearchParams(location.hash.slice(1)).has('pair')) {
     if (!update || typeof update !== 'object') return;
     const oldThread = state.threadId;
     Object.assign(state, update);
+    renderAssistantName();
+    renderVoiceChoice();
     if (!permissionChoiceExplicit && ['ask', 'yolo'].includes(state.permissionMode)) {
       el('permission-mode').value = state.permissionMode;
       renderPermissionChoice();
@@ -220,10 +277,11 @@ if (new URLSearchParams(location.hash.slice(1)).has('pair')) {
     el('cwd').disabled = el('new-session').disabled;
     el('effort').disabled = el('new-session').disabled;
     el('permission-mode').disabled = el('new-session').disabled;
+    el('voice').disabled = authExpired || !availableVoices.length || sessionBusy || inVoice || voiceStartPending || voiceStopPending || Boolean(state.voiceActive);
     el('yolo-active').hidden = !(state.threadId && state.permissionMode === 'yolo');
     el('send-text').disabled = authExpired || textBusy || sessionBusy;
     el('interrupt').disabled = authExpired || !state.activeTurnId;
-    el('work-status').textContent = approvals.size ? 'Freigabe nötig' : state.activeTurnId ? 'Astra arbeitet' : 'Bereit';
+    el('work-status').textContent = approvals.size ? 'Freigabe nötig' : state.activeTurnId ? `${assistantName()} is working` : 'Bereit';
     el('work-dot').classList.toggle('working', Boolean(state.activeTurnId));
   }
 
@@ -234,7 +292,7 @@ if (new URLSearchParams(location.hash.slice(1)).has('pair')) {
       idle: ['Bereit, wenn du es bist.', 'Das Mikrofon ist aus.'],
       connecting: ['Gespräch wird verbunden …', 'Die Sprachverbindung startet.'],
       connected: ['Ich höre zu.', 'Du kannst einfach lossprechen.'],
-      muted: ['Mikrofon pausiert.', 'Du hörst weiterhin Astra.'],
+      muted: ['Mikrofon pausiert.', `You can still hear ${assistantName()}.`],
       background: ['Gespräch im Hintergrund.', 'Der Browser kann Mikrofon und Ton im Hintergrund pausieren.'],
       interrupted: ['Mikrofon unterbrochen.', 'Der Browser hat die Audioaufnahme pausiert.'],
       error: ['Verbindung unterbrochen.', 'Du kannst das Gespräch erneut starten.']
@@ -305,7 +363,13 @@ if (new URLSearchParams(location.hash.slice(1)).has('pair')) {
       article.className = `message ${kind}`;
       const heading = document.createElement('div');
       heading.className = 'message-label';
-      heading.textContent = label;
+      const speaker = document.createElement('span');
+      if (kind === 'assistant') {
+        const spoken = id.startsWith('voice-assistant-');
+        speaker.dataset.assistantMessage = spoken ? 'voice' : 'task';
+        speaker.textContent = spoken ? `${assistantName()} · Voice` : assistantName();
+      } else speaker.textContent = label;
+      heading.append(speaker);
       const time = document.createElement('time');
       time.dateTime = new Date().toISOString();
       time.textContent = new Intl.DateTimeFormat('de', { hour: '2-digit', minute: '2-digit' }).format(new Date());
@@ -465,7 +529,7 @@ if (new URLSearchParams(location.hash.slice(1)).has('pair')) {
     } else if (['response.output_audio_transcript.delta', 'response.audio_transcript.delta', 'response.output_text.delta', 'response.text.delta'].includes(type)) {
       const id = `voice-assistant-${data.response_id || data.item_id || spokenReplyId || Date.now()}`;
       spokenReplyId = id.replace('voice-assistant-', '');
-      message(id, 'assistant', 'Sprachantwort', data.delta || '', true);
+      message(id, 'assistant', 'voice', data.delta || '', true);
     } else if (type === 'response.done' || type.endsWith('_transcript.done') || type.endsWith('.text.done')) {
       if (spokenReplyId) finishMessage(`voice-assistant-${spokenReplyId}`);
       spokenReplyId = null;
@@ -483,6 +547,7 @@ if (new URLSearchParams(location.hash.slice(1)).has('pair')) {
     if (authExpired || voiceStartPending || voiceStopPending || peer) return;
     clearNotice();
     voiceStartPending = true;
+    const selectedVoice = availableVoices.length && voiceChoiceExplicit ? el('voice').value : undefined;
     const generation = ++voiceGeneration;
     setVoicePhase('connecting');
     try {
@@ -550,7 +615,7 @@ if (new URLSearchParams(location.hash.slice(1)).has('pair')) {
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
       if (generation !== voiceGeneration) return;
-      const answer = await api('/api/voice/start', { sdp: pc.localDescription.sdp });
+      const answer = await api('/api/voice/start', { sdp: pc.localDescription.sdp, ...(selectedVoice === undefined ? {} : { voice: selectedVoice }) });
       if (generation !== voiceGeneration) { await api('/api/voice/stop', {}).catch(() => {}); return; }
       if (!answer.sdp) throw new Error('Die Sprachschnittstelle hat keine Verbindungsantwort geliefert.');
       if (answer.threadId) applyState({ threadId: answer.threadId });
@@ -617,7 +682,8 @@ if (new URLSearchParams(location.hash.slice(1)).has('pair')) {
     const card = document.createElement('article');
     card.className = 'approval-card';
     const title = document.createElement('h3');
-    title.textContent = 'Astra braucht deine Freigabe';
+    title.dataset.assistantApproval = '';
+    title.textContent = `${assistantName()} needs your approval`;
     card.append(title);
     if (params.reason) { const reason = document.createElement('p'); reason.textContent = params.reason; card.append(reason); }
     const command = params.command;
@@ -702,7 +768,7 @@ if (new URLSearchParams(location.hash.slice(1)).has('pair')) {
       if (!transcripts.has(role)) transcripts.set(role, `voice-${role}-${++transcriptSequence}`);
       const id = transcripts.get(role);
       const isDelta = method.endsWith('/delta');
-      message(id, role, role === 'user' ? 'Du · Sprache' : 'Sprachantwort', isDelta ? (params.delta || '') : (params.text || ''), isDelta);
+      message(id, role, role === 'user' ? 'Du · Sprache' : 'voice', isDelta ? (params.delta || '') : (params.text || ''), isDelta);
       if (!isDelta) {
         captureTranscript(role, params.text, params.itemId || params.item_id || `${memoryClientId}-${id}`, params.threadId || state.threadId);
         finishMessage(id); transcripts.delete(role);
@@ -714,13 +780,13 @@ if (new URLSearchParams(location.hash.slice(1)).has('pair')) {
       for (const id of messages.keys()) finishMessage(id);
       if (params.turn?.error?.message) notice(params.turn.error.message);
     } else if (method === 'item/agentMessage/delta') {
-      message(`astra-${params.itemId || params.turnId || 'active'}`, 'assistant', 'Astra', params.delta || '', true);
+      message(`astra-${params.itemId || params.turnId || 'active'}`, 'assistant', assistantName(), params.delta || '', true);
     } else if (method === 'item/started') {
       if (params.item?.id) toolItems.set(params.item.id, params.item);
     } else if (method === 'item/completed') {
       const item = params.item || {};
       if (item.id) toolItems.set(item.id, item);
-      if (item.type === 'agentMessage' && item.text) message(`astra-${item.id || params.itemId || params.turnId || 'active'}`, 'assistant', 'Astra', item.text);
+      if (item.type === 'agentMessage' && item.text) message(`astra-${item.id || params.itemId || params.turnId || 'active'}`, 'assistant', assistantName(), item.text);
       finishMessage(`astra-${item.id || params.itemId || params.turnId || 'active'}`);
     } else if (method === 'thread/realtime/error') {
       notice(params.message || params.error?.message || 'Die Sprachsitzung hat einen Fehler gemeldet.');

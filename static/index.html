@@ -4,14 +4,14 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="color-scheme" content="dark">
-  <title>Astra · Sprache</title>
+  <title>Astra · Voice</title>
   <link rel="stylesheet" href="/style.css">
   <script src="/app.js" defer></script>
 </head>
 <body>
   <main class="shell">
     <header class="topbar">
-      <a class="wordmark" href="/" aria-label="Astra Sprache Startseite"><span class="brand-star" aria-hidden="true">✳</span> Astra <span class="brand-divider">/</span> <span class="brand-section">Sprache</span></a>
+      <a class="wordmark" href="/" aria-label="Astra Voice home"><span class="brand-star" aria-hidden="true">✳</span> <span data-assistant-name>Astra</span> <span class="brand-divider">/</span> <span class="brand-section">Voice</span></a>
       <span class="experiment">Experimentell</span>
     </header>
 
@@ -20,7 +20,7 @@
         <div class="intro">
           <p class="eyebrow">DEIN LOKALER CODEX</p>
           <h1 id="page-title">Sag, was<br>wir machen.</h1>
-          <p class="intro-copy">Sprich mit Astra, während es arbeitet. Du kannst jederzeit eingreifen.</p>
+          <p class="intro-copy">Talk to <span data-assistant-name>Astra</span> while work gets done. You can jump in anytime.</p>
         </div>
 
         <div class="voice-control" id="voice-control" data-phase="idle">
@@ -37,10 +37,17 @@
             <button id="mute-voice" class="button secondary" type="button" aria-pressed="false">Mikro aus</button>
             <button id="stop-voice" class="button secondary" type="button">Beenden</button>
           </div>
+          <div id="voice-field" class="voice-field" hidden>
+            <label for="voice">Voice</label>
+            <select id="voice" name="voice" aria-describedby="voice-hint">
+              <option value="default">Provider default · keep current voice</option>
+            </select>
+            <p id="voice-hint">To change voices, end voice, choose one, and start again. Your Codex session stays open.</p>
+          </div>
           <button id="enable-audio" class="button text-button full-width" type="button" hidden>Ton aktivieren</button>
           <p id="wake-status" class="wake-status" hidden>Bildschirm bleibt während des Gesprächs an.</p>
           <p id="memory-status" class="memory-status" role="status" hidden></p>
-          <p class="privacy-note">Astra arbeitet über Codex.<br>Mikrofon startet erst per Klick.</p>
+          <p class="privacy-note"><span data-assistant-name>Astra</span> works through Codex.<br>The microphone starts when you tap.</p>
           <p class="mobile-note">Auf dem iPhone diese Seite im Vordergrund lassen. Beim Sperren oder Appwechsel kann Safari die Sprache pausieren.</p>
           <p class="capability-note">Computer Use: nur mit OpenAIs nativem Dienst.</p>
         </div>
@@ -101,10 +108,10 @@
         <div id="approvals" class="approvals" aria-label="Ausstehende Freigaben"></div>
 
         <div class="composer-area">
-          <button id="interrupt" class="interrupt-button" type="button" disabled><span class="stop-square" aria-hidden="true"></span> Astra unterbrechen</button>
+          <button id="interrupt" class="interrupt-button" type="button" disabled><span class="stop-square" aria-hidden="true"></span> Interrupt <span data-assistant-name>Astra</span></button>
           <form id="text-form" class="composer">
-            <label class="visually-hidden" for="message">Nachricht an Astra</label>
-            <textarea id="message" rows="1" placeholder="Oder schreib Astra etwas …" maxlength="30000"></textarea>
+            <label class="visually-hidden" for="message">Message <span data-assistant-name>Astra</span></label>
+            <textarea id="message" rows="1" placeholder="Or write to Astra…" maxlength="30000"></textarea>
             <button id="send-text" type="submit" aria-label="Nachricht senden" title="Nachricht senden"><span aria-hidden="true">↑</span></button>
           </form>
           <div class="composer-footer"><span id="connection-status" role="status"><span class="connection-dot"></span> Verbinde mit Codex …</span><span>Enter senden · ⇧ Enter Absatz</span></div>

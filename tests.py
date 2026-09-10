@@ -192,7 +192,8 @@ class StateTests(unittest.TestCase):
         request = next(v for v in self.process.sent if v.get("method") == "thread/resume")
         self.assertEqual(request["params"]["approvalPolicy"], "never")
         self.assertEqual(request["params"]["sandbox"], "danger-full-access")
-        self.assertEqual(request["params"]["developerInstructions"], voice.COMPUTER_USE_INSTRUCTIONS)
+        self.assertEqual(request["params"]["developerInstructions"],
+                         voice.COMPUTER_USE_INSTRUCTIONS + "\n\n" + self.codex.persona_instructions)
         self.assertNotIn("baseInstructions", request["params"])
 
     def test_new_session_preserves_base_instructions_and_adds_native_only_policy(self):
@@ -200,7 +201,8 @@ class StateTests(unittest.TestCase):
         self.process.results["thread/start"] = {"thread": {"id": "new-thread"}}
         self.codex.session({"cwd": self.folder.name})
         params = next(v["params"] for v in self.process.sent if v.get("method") == "thread/start")
-        self.assertEqual(params["developerInstructions"], voice.COMPUTER_USE_INSTRUCTIONS)
+        self.assertEqual(params["developerInstructions"],
+                         voice.COMPUTER_USE_INSTRUCTIONS + "\n\n" + self.codex.persona_instructions)
         self.assertTrue(params["developerInstructions"].strip())
         self.assertNotIn("baseInstructions", params)
         self.assertEqual(params["approvalPolicy"], "on-request")
