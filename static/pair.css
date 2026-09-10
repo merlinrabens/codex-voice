@@ -34,7 +34,9 @@ details p { font-size: 13px; }
 .command-row { display: flex; align-items: center; gap: 12px; background: #1b1f19; border: 1px solid #ffffff1a; border-radius: 8px; padding: 10px 12px; }
 pre { flex: 1; min-width: 0; margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 code { font-size: 12px; line-height: 1.6; }
-.copy-command { flex: 0 0 44px; width: 44px; min-height: 44px; margin: 0; padding: 0; border: 0; border-radius: 6px; background: transparent; color: #d5eeab; display: grid; place-items: center; }
+.copy-command { flex: 0 0 44px; width: 44px; height: 44px; min-height: 44px; margin: 0; padding: 0; border: 0; border-radius: 6px; background: transparent; color: #d5eeab; display: flex; justify-content: center; align-items: center; }
+.copy-command svg { display: block; flex-shrink: 0; }
+.copy-command:focus-visible { outline-offset: 2px; }
 .copy-command:hover:not(:disabled) { background: #d5eeab12; }
 #copy-status { min-height: 20px; margin: 6px 0 0; font-size: 12px; color: #b0bb9e; }
 .footnote { font-size: 12px; color: #7f8878; margin-top: 28px; }
