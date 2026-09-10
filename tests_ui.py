@@ -7,6 +7,7 @@ is used when available; otherwise Playwright's installed Chromium is used.
 import json
 import mimetypes
 import os
+import re
 from pathlib import Path
 import tempfile
 import threading
@@ -17,9 +18,11 @@ from playwright.sync_api import expect, sync_playwright
 
 
 ROOT = Path(__file__).resolve().parent
-VOICE_OPTIONS = ['alloy', 'arbor', 'ash', 'ballad', 'breeze', 'cedar', 'coral',
-                 'cove', 'echo', 'ember', 'juniper', 'maple', 'marin', 'sage',
-                 'shimmer', 'sol', 'spruce', 'vale', 'verse']
+VOICE_OPTIONS = ['juniper', 'maple', 'spruce', 'ember', 'vale', 'breeze',
+                 'arbor', 'sol', 'cove']
+LEGACY_VOICE_OPTIONS = ['alloy', 'arbor', 'ash', 'ballad', 'breeze', 'cedar',
+                        'coral', 'cove', 'echo', 'ember', 'juniper', 'maple',
+                        'marin', 'sage', 'shimmer', 'sol', 'spruce', 'vale', 'verse']
 BOOT = r"""
 window.uiFixture = {micCalls:0, contexts:[], inputContexts:[], tracks:[], peers:[], channels:[], storageWrites:[], speakerConnections:0, audioPlays:[], actions:[], wakeLocks:[], visibility:'visible'};
 const nativeFetch = window.fetch;
@@ -235,7 +238,7 @@ def run():
                 expect(named.locator('#message')).to_have_attribute('placeholder', 'Or write to Jerry…')
                 expect(named.locator('#interrupt')).to_have_text('Interrupt Jerry')
                 expect(named.locator('#voice-field')).to_be_visible()
-                expect(named.locator('#voice option')).to_have_count(20)
+                expect(named.locator('#voice option')).to_have_count(10)
                 expect(named.locator('#voice')).to_have_value('default')
                 assert named.evaluate('document.documentElement.scrollWidth <= innerWidth')
                 assert named.locator('#voice').evaluate('element => getComputedStyle(element).fontSize') == '16px'
@@ -267,7 +270,7 @@ def run():
                 sessions_before = len([path for path, _ in server.requests if path == '/api/session'])
                 named.locator('#start-voice').click()
                 expect(named.locator('#voice-control')).to_have_attribute('data-phase', 'connected')
-                assert 'voice' not in last_voice_start()
+                assert last_voice_start()['voice'] == 'default'
                 original_thread = server.state['threadId']
                 expect(named.locator('#voice')).to_be_disabled()
                 named.locator('#mute-voice').click()
@@ -275,15 +278,15 @@ def run():
                 expect(named.locator('#voice')).to_be_disabled()
                 named.locator('#stop-voice').click()
                 expect(named.locator('#voice')).to_be_enabled()
-                named.locator('#voice').select_option('cedar')
-                assert named.evaluate('uiFixture.storageWrites') == [{'key': 'codex-voice.voice', 'value': 'cedar'}]
+                named.locator('#voice').select_option('ember')
+                assert named.evaluate('uiFixture.storageWrites') == [{'key': 'codex-voice.voice', 'value': 'ember'}]
                 named.evaluate('() => { uiFixture.offerGate = new Promise(resolve => { uiFixture.releaseOffer = resolve; }); }')
                 named.locator('#start-voice').click()
                 expect(named.locator('#voice-control')).to_have_attribute('data-phase', 'connecting')
                 expect(named.locator('#voice')).to_be_disabled()
                 named.evaluate('uiFixture.releaseOffer()')
                 expect(named.locator('#voice-control')).to_have_attribute('data-phase', 'connected')
-                assert last_voice_start()['voice'] == 'cedar'
+                assert last_voice_start()['voice'] == 'ember'
                 assert server.state['threadId'] == original_thread
                 named.locator('#stop-voice').click()
                 expect(named.locator('#voice')).to_be_enabled()
@@ -298,9 +301,9 @@ def run():
                 expect(named.locator('#voice')).to_be_enabled()
                 named.reload()
                 expect(named.locator('#voice')).to_have_value('default')
-                named.locator('#voice').select_option('marin')
+                named.locator('#voice').select_option('cove')
                 named.reload()
-                expect(named.locator('#voice')).to_have_value('marin')
+                expect(named.locator('#voice')).to_have_value('cove')
                 assert named.evaluate('uiFixture.storageWrites.length') == 0
                 assert named.evaluate('uiFixture.micCalls') == 0
                 screenshot_dir = os.environ.get('CODEX_VOICE_UI_SCREENSHOTS')
@@ -309,6 +312,38 @@ def run():
                     destination.mkdir(parents=True, exist_ok=True)
                     named.screenshot(path=str(destination / 'voice-choice-mobile.png'), full_page=True)
                 report.append('voice choices preserve provider default, persist explicit selection, lock during connecting and active voice, and restart without creating another Codex thread')
+
+                server.state.update(voice='alloy', voiceOptions=LEGACY_VOICE_OPTIONS)
+                named.evaluate("localStorage.setItem('codex-voice.voice', 'alloy')")
+                named.reload()
+                expect(named.locator('#voice')).to_have_value('default')
+                expect(named.locator('#voice option')).to_have_count(10)
+                assert set(named.locator('#voice option').evaluate_all('options => options.map(option => option.value)')) == {'default', *VOICE_OPTIONS}
+                expect(named.locator('#voice option[value="alloy"]')).to_have_count(0)
+                expect(named.locator('#voice-hint')).to_be_visible()
+                expect(named.locator('#voice-hint')).to_contain_text(re.compile(r'unsupported|unavailable|not (?:available|supported)', re.IGNORECASE))
+                expect(named.locator('#voice-hint')).to_contain_text(re.compile(r'default|reset', re.IGNORECASE))
+                assert named.evaluate("localStorage.getItem('codex-voice.voice')") in (None, 'default')
+                legacy_sessions_before = len([path for path, _ in server.requests if path == '/api/session'])
+                named.locator('#start-voice').click()
+                expect(named.locator('#voice-control')).to_have_attribute('data-phase', 'connected')
+                assert last_voice_start()['voice'] == 'default'
+                assert server.state['threadId'] == original_thread
+                assert len([path for path, _ in server.requests if path == '/api/session']) == legacy_sessions_before
+                named.locator('#stop-voice').click()
+                expect(named.locator('#voice')).to_be_enabled()
+                named.locator('#voice').select_option('cove')
+                server.state['voice'] = 'alloy'
+                named.reload()
+                expect(named.locator('#voice')).to_have_value('cove')
+                assert named.evaluate("localStorage.getItem('codex-voice.voice')") == 'cove'
+                named.locator('#start-voice').click()
+                expect(named.locator('#voice-control')).to_have_attribute('data-phase', 'connected')
+                assert last_voice_start()['voice'] == 'cove'
+                assert server.state['threadId'] == original_thread
+                named.locator('#stop-voice').click()
+                expect(named.locator('#start-voice')).to_be_enabled()
+                report.append('legacy 19-voice advertisements and saved Alloy reset to provider default with an explanation and an explicit override; valid saved Cove survives without replacing the Codex thread')
 
                 server.state.pop('assistantName')
                 server.state.pop('voiceOptions')
@@ -322,13 +357,14 @@ def run():
                 assert 'voice' not in last_voice_start()
                 named.locator('#stop-voice').click()
                 expect(named.locator('#start-voice')).to_be_enabled()
-                server.state.update(assistantName='Jerry', voice='ash', voiceOptions=VOICE_OPTIONS)
+                server.state.update(assistantName='Jerry', voice='juniper', voiceOptions=VOICE_OPTIONS)
                 named.evaluate("localStorage.setItem('codex-voice.voice', 'unknown-voice')")
                 named.reload()
-                expect(named.locator('#voice')).to_have_value('ash')
+                expect(named.locator('#voice')).to_have_value('juniper')
+                expect(named.locator('#voice-hint')).to_contain_text(re.compile(r'unsupported|unavailable|not (?:available|supported)', re.IGNORECASE))
                 named.locator('#start-voice').click()
                 expect(named.locator('#voice-control')).to_have_attribute('data-phase', 'connected')
-                assert 'voice' not in last_voice_start()
+                assert last_voice_start()['voice'] == 'juniper'
                 named.locator('#stop-voice').click()
                 expect(named.locator('#start-voice')).to_be_enabled()
                 assert not named_errors, named_errors

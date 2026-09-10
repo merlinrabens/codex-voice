@@ -47,8 +47,13 @@ if (new URLSearchParams(location.hash.slice(1)).has('pair')) {
   let memoryError = false;
   const permissionStorageKey = 'codex-voice.permission-mode';
   const voiceStorageKey = 'codex-voice.voice';
+  // V3 supports a subset of Codex's shared RealtimeVoice enum. Also filter
+  // older running servers that still advertise the full mixed-version list.
+  const v3Voices = new Set(['arbor', 'breeze', 'cove', 'ember', 'juniper', 'maple', 'sol', 'spruce', 'vale']);
+  const voiceHint = 'To change voices, end voice, choose one, and start again. Your Codex session stays open.';
   let savedVoiceChoice = null;
   let voiceChoiceExplicit = false;
+  let voiceChoiceReset = false;
   let availableVoices = [];
   let voiceOptionsKey = null;
   let renderedAssistantName = null;
@@ -98,9 +103,14 @@ if (new URLSearchParams(location.hash.slice(1)).has('pair')) {
 
   function renderVoiceChoice() {
     availableVoices = Array.isArray(state.voiceOptions)
-      ? [...new Set(state.voiceOptions.filter((voice) => typeof voice === 'string' && /^[a-z][a-z0-9-]{0,31}$/.test(voice) && voice !== 'default'))]
+      ? [...new Set(state.voiceOptions.filter((voice) => v3Voices.has(voice)))]
       : [];
     el('voice-field').hidden = !availableVoices.length;
+    if (availableVoices.length && savedVoiceChoice !== null && savedVoiceChoice !== 'default' && !availableVoices.includes(savedVoiceChoice)) {
+      savedVoiceChoice = null;
+      voiceChoiceReset = true;
+      try { localStorage.removeItem(voiceStorageKey); } catch { /* Discard the invalid choice for this page. */ }
+    }
     const key = JSON.stringify(availableVoices);
     if (key !== voiceOptionsKey) {
       voiceOptionsKey = key;
@@ -114,13 +124,24 @@ if (new URLSearchParams(location.hash.slice(1)).has('pair')) {
       el('voice').value = savedVoiceChoice;
       voiceChoiceExplicit = true;
     }
-    if (!voiceChoiceExplicit) el('voice').value = availableVoices.includes(state.voice) ? state.voice : 'default';
+    if (!voiceChoiceExplicit) {
+      const validServerVoice = availableVoices.includes(state.voice);
+      el('voice').value = validServerVoice ? state.voice : 'default';
+      if (availableVoices.length && state.voice && state.voice !== 'default' && !validServerVoice) voiceChoiceReset = true;
+    }
+    const choice = el('voice').value;
+    const choiceLabel = choice === 'default' ? 'Provider default' : choice[0]?.toUpperCase() + choice.slice(1);
+    el('voice-hint').textContent = voiceChoiceReset
+      ? `Your previous voice is unavailable for this connection. ${choiceLabel} is selected. You can choose another voice before starting.`
+      : voiceHint;
   }
 
   el('voice').addEventListener('change', () => {
     const choice = el('voice').value;
     if (!availableVoices.length || (choice !== 'default' && !availableVoices.includes(choice))) return;
     voiceChoiceExplicit = true;
+    voiceChoiceReset = false;
+    el('voice-hint').textContent = voiceHint;
     savedVoiceChoice = choice;
     try { localStorage.setItem(voiceStorageKey, choice); } catch { /* Keep this page's explicit choice. */ }
   });
@@ -547,7 +568,9 @@ if (new URLSearchParams(location.hash.slice(1)).has('pair')) {
     if (authExpired || voiceStartPending || voiceStopPending || peer) return;
     clearNotice();
     voiceStartPending = true;
-    const selectedVoice = availableVoices.length && voiceChoiceExplicit ? el('voice').value : undefined;
+    // Send the visible selection, including default, to clear unsupported
+    // selections retained by an older running backend after a failed start.
+    const selectedVoice = availableVoices.length ? el('voice').value : undefined;
     const generation = ++voiceGeneration;
     setVoicePhase('connecting');
     try {

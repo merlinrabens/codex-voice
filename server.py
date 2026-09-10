@@ -23,11 +23,10 @@ from persona import load_persona, persona_instructions
 
 ROOT = Path(__file__).resolve().parent
 EFFORTS = {'low', 'medium', 'high', 'xhigh', 'ultra'}
-# RealtimeVoice from the installed Codex 0.153.4 experimental protocol schema.
-# Protocol support does not guarantee availability for every account/backend.
-VOICE_OPTIONS = ('alloy', 'arbor', 'ash', 'ballad', 'breeze', 'cedar', 'coral',
-                 'cove', 'echo', 'ember', 'juniper', 'maple', 'marin', 'sage',
-                 'shimmer', 'sol', 'spruce', 'vale', 'verse')
+# Voices accepted by the Realtime V3 backend used by this client.
+# The shared Codex RealtimeVoice enum also includes voices unsupported by V3.
+VOICE_OPTIONS = ('arbor', 'breeze', 'cove', 'ember', 'juniper', 'maple',
+                 'sol', 'spruce', 'vale')
 PERMISSION_MODES = {
     'ask': {'approvalPolicy': 'on-request', 'sandbox': 'workspace-write'},
     'yolo': {'approvalPolicy': 'never', 'sandbox': 'danger-full-access'},

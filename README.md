@@ -49,7 +49,9 @@ The optional age describes an AI persona, not a human biography. A profile chang
 
 Use the **Voice** selector before starting voice. **Provider default · keep current voice** leaves the provider's original voice choice in place. The browser keeps an explicit selection for later visits to the same origin. End voice, choose another voice, then start again to try it; your Codex session and task context stay open. Changing the voice does not change the assistant's name or model.
 
-The Codex CLI `0.153.4` protocol lists these 19 named choices: Alloy, Arbor, Ash, Ballad, Breeze, Cedar, Coral, Cove, Echo, Ember, Juniper, Maple, Marin, Sage, Shimmer, Sol, Spruce, Vale, and Verse. Protocol support does not establish that every voice is available to every account; this project has not live-tested all 19. The selector follows the server's advertised options and stays hidden when connected to an older server without voice selection support.
+Unsupported saved choices are cleared with an explanation. The selector uses a supported server choice or the provider default and sends that displayed selection when you start voice. This also recovers an older running server that retained an unsupported choice after a failed connection, without restarting the server or tunnel.
+
+This client uses Realtime V3, whose backend supports nine named voices: Arbor, Breeze, Cove, Ember, Juniper, Maple, Sol, Spruce, and Vale. The shared Codex CLI `0.153.4` voice enum contains 19 names across protocols, but names such as Alloy, Cedar, and Marin are not supported by V3. This client exposes only the V3 choices and rejects other names before starting a connection. Individual voices still depend on backend availability; this project has not live-tested all nine. The selector stays hidden when connected to an older server without voice selection support.
 
 ### Optional command installation
 

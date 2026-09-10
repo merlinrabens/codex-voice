@@ -148,8 +148,8 @@ class PersonaAndVoiceTests(unittest.TestCase):
         self.assertEqual(state["assistantName"], "Jerry")
         self.assertEqual(state["assistantAge"], 28)
         self.assertEqual(state["voice"], "default")
-        self.assertEqual(len(state["voiceOptions"]), 19)
-        self.assertEqual(len(set(state["voiceOptions"])), 19)
+        self.assertEqual(len(state["voiceOptions"]), 9)
+        self.assertEqual(len(set(state["voiceOptions"])), 9)
         self.assertNotIn(self.profile["instructions"], json.dumps(state))
 
     def test_persona_reaches_new_and_resumed_task_threads_without_replacing_model_or_policy(self):
@@ -208,25 +208,27 @@ class PersonaAndVoiceTests(unittest.TestCase):
 
     def test_selected_voice_is_explicit_and_restarts_keep_the_task_thread(self):
         with patch.object(self.codex, "rpc", side_effect=self.successful_rpc) as rpc:
-            self.codex.start_voice({"sdp": "v=0", "voice": "cedar"})
+            self.codex.start_voice({"sdp": "v=0", "voice": "cove"})
             self.codex.stop_voice()
-            self.codex.start_voice({"sdp": "v=0", "voice": "marin"})
+            self.codex.start_voice({"sdp": "v=0", "voice": "maple"})
             self.codex.stop_voice()
             self.codex.start_voice({"sdp": "v=0"})
         starts = [call.args[1] for call in rpc.call_args_list if call.args[0] == "thread/realtime/start"]
-        self.assertEqual([params["voice"] for params in starts], ["cedar", "marin", "marin"])
+        self.assertEqual([params["voice"] for params in starts], ["cove", "maple", "maple"])
         self.assertTrue(all(params["threadId"] == "existing-thread" for params in starts))
         self.assertEqual(self.codex.state["threadId"], "existing-thread")
         self.assertFalse(any(call.args[0] in ("thread/start", "thread/resume") for call in rpc.call_args_list))
 
     def test_explicit_default_restores_provider_selection_without_a_voice_parameter(self):
-        self.codex.state["voice"] = "cedar"
+        self.codex.state["voice"] = "cove"
         with patch.object(self.codex, "rpc", side_effect=self.successful_rpc) as rpc:
             self.codex.start_voice({"sdp": "v=0", "voice": "default"})
         self.assertNotIn("voice", rpc.call_args.args[1])
         self.assertEqual(self.codex.state["voice"], "default")
 
     def test_every_listed_voice_is_accepted_without_changing_its_identifier(self):
+        self.assertEqual(set(voice.VOICE_OPTIONS),
+                         {"juniper", "maple", "spruce", "ember", "vale", "breeze", "arbor", "sol", "cove"})
         with patch.object(self.codex, "rpc", side_effect=self.successful_rpc) as rpc:
             for selected in voice.VOICE_OPTIONS:
                 with self.subTest(voice=selected):
@@ -234,10 +236,24 @@ class PersonaAndVoiceTests(unittest.TestCase):
                     self.assertEqual(rpc.call_args.args[1]["voice"], selected)
                     self.codex.stop_voice()
 
+    def test_shared_enum_voices_unsupported_by_v3_are_rejected_before_rpc(self):
+        before = self.codex.snapshot()
+        unsupported = ("alloy", "ash", "ballad", "cedar", "coral", "echo", "marin", "sage", "shimmer", "verse")
+        with patch.object(self.codex, "rpc") as rpc, patch.object(voice.subprocess, "Popen") as popen:
+            for selected in unsupported:
+                with self.subTest(voice=selected):
+                    with self.assertRaises(voice.RequestError):
+                        self.codex.start_voice({"sdp": "v=0", "voice": selected})
+                    with self.assertRaises(voice.RequestError):
+                        voice.Codex(self.folder.name, voice=selected)
+        rpc.assert_not_called()
+        popen.assert_not_called()
+        self.assertEqual(self.codex.snapshot(), before)
+
     def test_invalid_voice_values_are_rejected_before_state_change_or_rpc(self):
         before = self.codex.snapshot()
         with patch.object(self.codex, "rpc") as rpc:
-            for selected in (None, True, 28, [], {}, "", "unknown", "Cedar", "cedar\n"):
+            for selected in (None, True, 28, [], {}, "", "unknown", "Cove", "cove\n"):
                 with self.subTest(voice=selected):
                     with self.assertRaises(voice.RequestError):
                         self.codex.start_voice({"sdp": "v=0", "voice": selected})
@@ -253,26 +269,26 @@ class PersonaAndVoiceTests(unittest.TestCase):
         popen.assert_not_called()
 
     def test_voice_cannot_change_during_an_active_connection(self):
-        self.codex.state.update(voiceActive=True, voice="cedar")
+        self.codex.state.update(voiceActive=True, voice="cove")
         with patch.object(self.codex, "rpc") as rpc:
             with self.assertRaises(voice.RequestError):
-                self.codex.start_voice({"sdp": "v=0", "voice": "marin"})
+                self.codex.start_voice({"sdp": "v=0", "voice": "maple"})
         rpc.assert_not_called()
-        self.assertEqual(self.codex.state["voice"], "cedar")
+        self.assertEqual(self.codex.state["voice"], "cove")
 
     def test_backend_rejection_surfaces_original_error_without_voice_fallback(self):
         def rejected_rpc(method, params, **kwargs):
             if method == "thread/realtime/start":
-                raise voice.RequestError("Selected voice cedar is unavailable for this account")
+                raise voice.RequestError("Selected voice cove is unavailable for this account")
             return {}
 
         with patch.object(self.codex, "rpc", side_effect=rejected_rpc) as rpc:
-            with self.assertRaisesRegex(voice.RequestError, "cedar is unavailable"):
-                self.codex.start_voice({"sdp": "v=0", "voice": "cedar"})
+            with self.assertRaisesRegex(voice.RequestError, "cove is unavailable"):
+                self.codex.start_voice({"sdp": "v=0", "voice": "cove"})
         calls = rpc.call_args_list
         self.assertEqual([call.args[0] for call in calls], ["thread/realtime/start", "thread/realtime/stop"])
-        self.assertEqual(calls[0].args[1]["voice"], "cedar")
-        self.assertEqual(self.codex.state["voice"], "cedar")
+        self.assertEqual(calls[0].args[1]["voice"], "cove")
+        self.assertEqual(self.codex.state["voice"], "cove")
         self.assertFalse(self.codex.state["voiceActive"])
         self.assertEqual(self.codex.state["voiceStatus"], "idle")
         self.assertEqual(self.codex.state["threadId"], "existing-thread")
@@ -281,16 +297,16 @@ class PersonaAndVoiceTests(unittest.TestCase):
         def event_error_rpc(method, params, **kwargs):
             if method == "thread/realtime/start":
                 with self.codex.condition:
-                    self.codex.voice_error = "This account cannot use cedar"
+                    self.codex.voice_error = "This account cannot use cove"
                     self.codex.condition.notify_all()
             return {}
 
         with patch.object(self.codex, "rpc", side_effect=event_error_rpc) as rpc:
-            with self.assertRaisesRegex(voice.RequestError, "cannot use cedar"):
-                self.codex.start_voice({"sdp": "v=0", "voice": "cedar"})
+            with self.assertRaisesRegex(voice.RequestError, "cannot use cove"):
+                self.codex.start_voice({"sdp": "v=0", "voice": "cove"})
         self.assertEqual(sum(call.args[0] == "thread/realtime/start" for call in rpc.call_args_list), 1)
         self.assertFalse(self.codex.state["voiceActive"])
-        self.assertEqual(self.codex.state["voice"], "cedar")
+        self.assertEqual(self.codex.state["voice"], "cove")
 
 
 if __name__ == "__main__":
