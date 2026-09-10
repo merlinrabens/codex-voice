@@ -13,6 +13,7 @@ import subprocess
 import sys
 import threading
 import time
+from control import request_pairing
 
 ROOT = Path(__file__).resolve().parent
 
@@ -27,14 +28,31 @@ def main():
     parser.add_argument('--memory-dir', help='Private conversation archive directory')
     parser.add_argument('--memory-index-script', help='Optional Python indexer to trigger after voice ends')
     parser.add_argument('--memory-index-python', default=sys.executable)
+    parser.add_argument('--pair', action='store_true', help='Renew the running server\'s pairing link without restarting it')
+    parser.add_argument('--copy', action='store_true', help='Copy the renewed pairing link to the Mac clipboard (requires --pair)')
     args = parser.parse_args()
+    private = Path(os.environ.get('CODEX_HOME', str(Path.home() / '.codex'))) / 'voice-access'
+    if args.copy and not args.pair:
+        parser.error('--copy requires --pair.')
+    if args.pair:
+        if args.copy and not shutil.which('pbcopy'):
+            parser.error('Clipboard copying requires pbcopy on this Mac.')
+        try:
+            connection = request_pairing(private / 'control.sock')
+        except (OSError, ValueError, RuntimeError) as exc:
+            parser.exit(1, f'Cannot renew pairing: {exc}. Start or update the remote Voice server first.\n')
+        if args.copy:
+            subprocess.run(['pbcopy'], input=connection['pairing_url'], text=True, check=True)
+            print('Fresh one-use pairing link copied. Open it on your phone within 30 minutes.')
+        else:
+            print(connection['pairing_url'])
+        return
     if not shutil.which('cloudflared'):
         parser.error('Install cloudflared before using remote access.')
     if not Path(args.cwd).expanduser().is_dir():
         parser.error('The project directory does not exist.')
     with socket.socket() as probe:
         probe.bind(('127.0.0.1', args.port))
-    private = Path(os.environ.get('CODEX_HOME', str(Path.home() / '.codex'))) / 'voice-access'
     private.mkdir(mode=0o700, parents=True, exist_ok=True)
     receipt = private / 'connection.json'
     children = []

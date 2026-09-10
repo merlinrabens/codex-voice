@@ -52,9 +52,19 @@ With `cloudflared` installed, start a temporary HTTPS tunnel and the authenticat
 python3 remote.py --cwd /path/to/your/project --keep-awake
 ```
 
-Open the `pairing_url` from the private `~/.codex/voice-access/connection.json` file in Safari on your iPhone. Tap **Mit meinem Mac verbinden**, then start voice and allow microphone access. The phone can use mobile data or a different Wi-Fi network. Add `--yolo` only when you want the same unrestricted task permissions as the local mode.
+Open the `pairing_url` from the private `~/.codex/voice-access/connection.json` file in Safari on your iPhone. Tap **Connect to my Mac**, then start voice and allow microphone access. The phone can use mobile data or a different Wi-Fi network. Add `--yolo` only when you want the same unrestricted task permissions as the local mode.
 
-The link pairs one browser, expires after 30 minutes, and is consumed once. Its code is carried in the URL fragment, removed before the page makes requests, and exchanged for a Secure, HttpOnly cookie. Treat the link as private. The browser session lasts up to 12 hours; restarting the server revokes it and generates a different tunnel URL. The private receipt is kept outside this checkout. `POST /api/logout` revokes the current browser session.
+The link pairs one browser, expires after 30 minutes, and is consumed once. Its code is carried in the URL fragment, removed before the page makes requests, and exchanged for a Secure, HttpOnly, SameSite=Strict cookie after you tap the connect button. Treat the link as private. No pairing code or login token is stored in browser local storage.
+
+The default login lasts up to 12 hours. Select **Remember this personal device for 30 days** before connecting to choose a 30-day login instead. This is a fixed expiry from pairing; activity does not extend it. Either choice works only while the same server and HTTPS origin remain available. Restarting the server revokes browser sessions, and restarting the temporary tunnel generates a different URL. The private receipt is kept outside this checkout. `POST /api/logout` revokes the current browser session.
+
+If you return to the connection page without a code, your login may have expired or your browser may have cleared its cookie. An expired or consumed pairing link cannot sign you in again. From the project directory on the Mac, create a fresh link and copy it to the clipboard:
+
+```sh
+python3 remote.py --pair --copy
+```
+
+Open that new link on your phone and connect again. This command talks to the running launcher through a local control socket accessible only to your Mac user. It replaces the unused pairing code and updates the private receipt without restarting the server, tunnel, or active Codex conversation. A valid existing browser login returns to the voice interface automatically, including when an external link initially opens the connection page because of the strict cookie policy.
 
 The Mac and launcher must stay running and online. `--keep-awake` prevents idle sleep on macOS while the launcher is running; it does not guarantee operation with a laptop lid closed. Keep Safari open during voice. If iOS interrupts the microphone or blocks playback, the page offers a restart or audio button. Real iPhone hardware behavior still needs device testing; browser emulation alone does not establish it.
 
@@ -117,6 +127,7 @@ python3 tests.py
 python3 tests_remote.py
 python3 tests_memory.py
 python3 tests_memory_integration.py
+node tests_pair_ui.js
 python3 scripts/publication_audit.py
 ```
 

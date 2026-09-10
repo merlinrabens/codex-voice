@@ -18,6 +18,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie, CookieError
 from urllib.parse import urlsplit, parse_qs
 from memory import VoiceMemory
+from control import LocalPairingControl, write_private_json
 
 ROOT = Path(__file__).resolve().parent
 EFFORTS = {'low', 'medium', 'high', 'xhigh', 'ultra'}
@@ -45,6 +46,7 @@ class RemoteAccess:
     """One-use pairing and process-local sessions; credentials never enter Codex."""
     cookie_name = '__Host-codex_voice'
     session_seconds = 12 * 60 * 60
+    remembered_seconds = 30 * 24 * 60 * 60
 
     def __init__(self, origin, pairing_code=None):
         parsed = urlsplit(origin)
@@ -89,7 +91,9 @@ class RemoteAccess:
             now = time.monotonic()
             return any(expiry > now for expiry in self.sessions.values()) and now - self.last_activity < 90
 
-    def pair(self, code):
+    def pair(self, code, remember=False):
+        if not isinstance(remember, bool):
+            raise ValueError('Remember-device preference must be a boolean.')
         with self.lock:
             now = time.monotonic()
             while self.attempts and self.attempts[0] <= now - 60:
@@ -102,8 +106,20 @@ class RemoteAccess:
                 return None
             self.pairing_code = None
             token = secrets.token_urlsafe(32)
-            self.sessions[self.digest(token)] = now + self.session_seconds
+            duration = self.remembered_seconds if remember else self.session_seconds
+            self.sessions[self.digest(token)] = now + duration
             return token
+
+    def renew_pairing(self, write_receipt):
+        """Issue a new local pairing invitation without revoking browser sessions."""
+        with self.lock:
+            code = secrets.token_urlsafe(24)
+            # A failed receipt write must leave the existing invitation usable.
+            connection = write_receipt(code)
+            self.pairing_code = code
+            self.pairing_expires = time.monotonic() + 30 * 60
+            self.attempts.clear()
+            return connection
 
     def revoke(self, cookie_header):
         with self.lock:
@@ -626,6 +642,14 @@ class Handler(BaseHTTPRequestHandler):
         if not self.authorized():
             return self.reply(403, {'error': 'Unzulässiger Host.'})
         path = urlsplit(self.path).path
+        # A cross-site navigation can withhold a SameSite=Strict cookie for the
+        # HTML request, then include it on same-origin assets. These public
+        # assets must load in either state so pair.js can recover the session.
+        pair_assets = {'/pair.js': ('pair.js', 'text/javascript'),
+                       '/pair.css': ('pair.css', 'text/css')}
+        if path in pair_assets:
+            name, mime = pair_assets[path]
+            return self.reply(200, (ROOT / 'static' / name).read_bytes(), mime)
         if not self.authenticated():
             public = {'/': ('pair.html', 'text/html'), '/index.html': ('pair.html', 'text/html'),
                       '/pair.js': ('pair.js', 'text/javascript'), '/pair.css': ('pair.css', 'text/css')}
@@ -716,10 +740,14 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(data, dict):
                 raise ValueError()
             if remote and path == '/api/pair':
-                token = remote.pair(data.get('code'))
+                remember = data.get('remember', False)
+                if not isinstance(remember, bool):
+                    raise ValueError('Remember-device preference must be a boolean.')
+                token = remote.pair(data.get('code'), remember=remember)
                 if not token:
                     return self.reply(403, {'error': 'Kopplungscode ungültig, abgelaufen oder bereits verwendet.'})
-                cookie = f'{remote.cookie_name}={token}; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age={remote.session_seconds}'
+                duration = remote.remembered_seconds if remember else remote.session_seconds
+                cookie = f'{remote.cookie_name}={token}; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age={duration}'
                 return self.reply(200, {'ok': True}, headers={'Set-Cookie': cookie})
             if remote and path == '/api/logout':
                 remote.revoke(self.headers.get('Cookie'))
@@ -780,21 +808,39 @@ def main():
                     except Exception:
                         pass
         threading.Thread(target=watch_voice_lease, daemon=True).start()
+    pairing_control = None
     if args.remote_origin:
-        receipt = Path(args.pairing_file).expanduser().resolve()
+        receipt_argument = Path(args.pairing_file).expanduser().absolute()
+        if receipt_argument.is_symlink():
+            codex.close()
+            server.server_close()
+            raise ValueError('The private pairing receipt must not be a symlink.')
+        receipt = receipt_argument.parent.resolve() / receipt_argument.name
         if receipt == ROOT or ROOT in receipt.parents:
             codex.close()
             server.server_close()
             raise ValueError('Keep the private pairing receipt outside the source checkout.')
         receipt.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        connection = {'origin': server.remote_access.origin,
-                      'pairing_url': server.remote_access.origin + '/#pair=' + server.remote_access.pairing_code,
-                      'pairing_valid_seconds': 1800, 'server_pid': os.getpid(),
-                      'permission_mode': codex.default_permission_mode}
-        fd = os.open(receipt, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0), 0o600)
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, 'w') as handle:
-            json.dump(connection, handle, indent=2)
+        def write_receipt(code):
+            connection = {'origin': server.remote_access.origin,
+                          'pairing_url': server.remote_access.origin + '/#pair=' + code,
+                          'pairing_valid_seconds': 1800, 'server_pid': os.getpid(),
+                          'issued_at': time.time(), 'permission_mode': codex.default_permission_mode}
+            write_private_json(receipt, connection)
+            return connection
+        try:
+            pairing_control = LocalPairingControl(
+                receipt.parent / 'control.sock',
+                lambda: server.remote_access.renew_pairing(write_receipt))
+            # Reserve local control before replacing another service's receipt.
+            write_receipt(server.remote_access.pairing_code)
+            pairing_control.start()
+        except Exception:
+            if pairing_control:
+                pairing_control.close()
+            codex.close()
+            server.server_close()
+            raise
     signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
     print(f'Codex Voice: http://127.0.0.1:{server.server_port}', flush=True)
     print('Mikrofon startet erst nach Klick im Browser. Beenden mit Ctrl+C.', flush=True)
@@ -803,6 +849,8 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        if pairing_control:
+            pairing_control.close()
         server.server_close()
         codex.close()
 

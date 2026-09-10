@@ -79,8 +79,11 @@ class RemoteBoundaryTests(unittest.TestCase):
         finally:
             connection.close()
 
-    def pair(self):
-        status, headers, body = self.request("POST", "/api/pair", {"code": self.access.pairing_code}, {"Origin": self.origin})
+    def pair(self, remember=None):
+        data = {"code": self.access.pairing_code}
+        if remember is not None:
+            data["remember"] = remember
+        status, headers, body = self.request("POST", "/api/pair", data, {"Origin": self.origin})
         self.assertEqual(status, 200, body)
         self.assertIn("Set-Cookie", headers)
         cookies = SimpleCookie()
@@ -158,6 +161,78 @@ class RemoteBoundaryTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body), {**self.server.codex.snapshot(), "clientTransport": "poll"})
         self.assertIn("no-store", headers.get("Cache-Control", ""))
+
+    def test_default_pairing_keeps_twelve_hour_session(self):
+        started = time.monotonic()
+        cookie, headers = self.pair()
+        cookies = SimpleCookie()
+        cookies.load(headers["Set-Cookie"])
+        self.assertEqual(int(cookies[self.cookie_name]["max-age"]), 12 * 60 * 60)
+        with patch.object(voice.time, "monotonic", return_value=started + 12 * 60 * 60 + 1):
+            status, _, body = self.request(headers={"Cookie": cookie})
+        self.assertEqual(status, 401)
+        self.assertNotIn(b"private-thread", body)
+
+    def test_explicitly_unremembered_pairing_keeps_twelve_hour_session(self):
+        cookie, headers = self.pair(remember=False)
+        cookies = SimpleCookie()
+        cookies.load(headers["Set-Cookie"])
+        self.assertEqual(int(cookies[self.cookie_name]["max-age"]), 12 * 60 * 60)
+        status, _, _ = self.request(headers={"Cookie": cookie})
+        self.assertEqual(status, 200)
+
+    def test_remembered_device_survives_twelve_hours_but_expires_after_thirty_days(self):
+        started = time.monotonic()
+        cookie, headers = self.pair(remember=True)
+        cookies = SimpleCookie()
+        cookies.load(headers["Set-Cookie"])
+        value = cookies[self.cookie_name]
+        self.assertEqual(int(value["max-age"]), 30 * 24 * 60 * 60)
+        self.assertTrue(value["secure"])
+        self.assertTrue(value["httponly"])
+        self.assertEqual(value["samesite"].lower(), "strict")
+        self.assertEqual(value["path"], "/")
+        self.assertEqual(value["domain"], "")
+        for elapsed in [12 * 60 * 60 + 1, 30 * 24 * 60 * 60 - 1]:
+            with self.subTest(elapsed=elapsed):
+                with patch.object(voice.time, "monotonic", return_value=started + elapsed):
+                    status, _, body = self.request(headers={"Cookie": cookie})
+                self.assertEqual(status, 200, body)
+        with patch.object(voice.time, "monotonic", return_value=started + 30 * 24 * 60 * 60 + 1):
+            status, _, body = self.request(headers={"Cookie": cookie})
+        self.assertEqual(status, 401)
+        self.assertNotIn(b"private-thread", body)
+
+    def test_remember_requires_boolean_without_consuming_pairing_code(self):
+        code = self.access.pairing_code
+        for remember in [None, 0, 1, "true", "false", [], {}]:
+            with self.subTest(remember=remember):
+                status, headers, body = self.request("POST", "/api/pair", {
+                    "code": code, "remember": remember,
+                }, {"Origin": self.origin})
+                self.assertEqual(status, 400, body)
+                self.assertNotIn("Set-Cookie", headers)
+                self.assertEqual(self.access.pairing_code, code)
+                self.assertEqual(self.access.sessions, {})
+        self.pair(remember=True)
+
+    def test_logout_revokes_remembered_device_session(self):
+        cookie, _ = self.pair(remember=True)
+        status, headers, _ = self.request("POST", "/api/logout", {}, {
+            "Cookie": cookie, "Origin": self.origin,
+        })
+        self.assertEqual(status, 200)
+        cookies = SimpleCookie()
+        cookies.load(headers["Set-Cookie"])
+        self.assertEqual(cookies[self.cookie_name]["max-age"], "0")
+        for method, path, data in [("GET", "/api/state", None), ("POST", "/api/text", {"text": "denied"})]:
+            with self.subTest(path=path):
+                status, _, body = self.request(method, path, data, {
+                    "Cookie": cookie, "Origin": self.origin,
+                })
+                self.assertEqual(status, 401)
+                self.assertNotIn(b"private-thread", body)
+        self.assertEqual(self.server.codex.calls, [])
 
     def test_pairing_code_cannot_be_replayed(self):
         code = self.access.pairing_code
@@ -276,12 +351,18 @@ class RemoteBoundaryTests(unittest.TestCase):
 
     def test_request_size_limit_prevents_dispatch(self):
         cookie, _ = self.pair()
-        status, _, _ = self.request("POST", "/api/text", headers={"Cookie": cookie, "Origin": self.origin}, raw=b"x" * 150001)
+        # The server rejects the declared length before reading a body. Sending
+        # the oversized body can race its intentional early connection close.
+        status, _, _ = self.request("POST", "/api/text", headers={
+            "Cookie": cookie, "Origin": self.origin, "Content-Length": "150001",
+        }, raw=b"")
         self.assertEqual(status, 413)
         self.assertEqual(self.server.codex.calls, [])
 
     def test_pairing_has_smaller_request_size_limit(self):
-        status, _, _ = self.request("POST", "/api/pair", headers={"Origin": self.origin}, raw=b"x" * 4097)
+        status, _, _ = self.request("POST", "/api/pair", headers={
+            "Origin": self.origin, "Content-Length": "4097",
+        }, raw=b"")
         self.assertEqual(status, 413)
         self.assertEqual(self.access.sessions, {})
         self.pair()
@@ -296,6 +377,53 @@ class RemoteBoundaryTests(unittest.TestCase):
                 self.assertNotIn(b"private-thread", body)
                 self.assertNotIn("Set-Cookie", headers)
                 self.assertIn("no-store", headers.get("Cache-Control", ""))
+
+    def test_pair_assets_load_when_strict_cookie_returns_after_cross_site_navigation(self):
+        cookie, _ = self.pair()
+        # A cross-site top-level navigation may omit a SameSite=Strict cookie.
+        # Its same-origin subresource requests then include the existing cookie.
+        status, _, body = self.request(path="/")
+        self.assertEqual(status, 200)
+        self.assertIn(b'id="pair-form"', body)
+        for path, mime in [("/pair.js", "text/javascript"), ("/pair.css", "text/css")]:
+            with self.subTest(path=path):
+                status, headers, body = self.request(path=path, headers={"Cookie": cookie})
+                self.assertEqual(status, 200, body)
+                self.assertTrue(headers["Content-Type"].startswith(mime))
+                self.assertNotIn(b"private-thread", body)
+                self.assertNotIn(cookie.split("=", 1)[1].encode(), body)
+                self.assertNotIn("Set-Cookie", headers)
+                self.assertIn("no-store", headers.get("Cache-Control", ""))
+        status, _, body = self.request(path="/api/state", headers={"Cookie": cookie})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(json.loads(body)["threadId"], "private-thread")
+
+    def test_public_pair_assets_do_not_grant_access_to_voice_ui_or_private_routes(self):
+        for path in ["/pair.js", "/pair.css"]:
+            with self.subTest(path=path):
+                status, headers, body = self.request(path=path)
+                self.assertEqual(status, 200, body)
+                self.assertNotIn("Set-Cookie", headers)
+                self.assertNotIn(b"private-thread", body)
+        for path in ["/app.js", "/style.css", "/api/state"]:
+            with self.subTest(path=path):
+                status, _, body = self.request(path=path)
+                self.assertEqual(status, 401)
+                self.assertNotIn(b"private-thread", body)
+
+    def test_http_cannot_issue_local_pairing_invitations(self):
+        cookie, _ = self.pair()
+        for path in ["/api/pair/renew", "/api/control", "/control.sock", "/connection.json"]:
+            for authenticated in [False, True]:
+                with self.subTest(path=path, authenticated=authenticated):
+                    headers = {"Origin": self.origin}
+                    if authenticated:
+                        headers["Cookie"] = cookie
+                    status, _, body = self.request("POST", path, {"action": "pair"}, headers)
+                    self.assertEqual(status, 404 if authenticated else 401)
+                    self.assertNotIn(b"pairing_url", body)
+                    self.assertNotIn(b"private-thread", body)
+                    self.assertIsNone(self.access.pairing_code)
 
     def test_malformed_json_cannot_dispatch(self):
         cookie, _ = self.pair()

@@ -1,5 +1,11 @@
 'use strict';
 
+// An already authenticated browser may open a fresh invitation directly here.
+// Remove its code before app requests without consuming the invitation.
+if (new URLSearchParams(location.hash.slice(1)).has('pair')) {
+  history.replaceState(null, '', `${location.pathname}${location.search}`);
+}
+
 (() => {
   const el = (id) => document.getElementById(id);
   const state = { threadId: null, cwd: '', model: 'gpt-6-astra', effort: 'high', permissionMode: 'ask', voiceActive: false, activeTurnId: null };

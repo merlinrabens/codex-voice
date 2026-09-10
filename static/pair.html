@@ -1,26 +1,37 @@
 <!doctype html>
-<html lang="de">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="referrer" content="no-referrer">
-  <title>Codex Voice · Verbinden</title>
+  <title>Codex Voice · Connect</title>
   <link rel="stylesheet" href="/pair.css">
   <script src="/pair.js" defer></script>
 </head>
 <body>
   <main>
     <div class="brand"><span>✳</span> Codex Voice</div>
-    <p class="eyebrow">DEIN MAC. DEINE STIMME.</p>
-    <h1>Von hier aus<br>weiterdenken.</h1>
-    <p>Verbinde dieses Gerät einmal mit deiner laufenden Voice-Sitzung. Danach kannst du direkt lossprechen.</p>
+    <p class="eyebrow">YOUR MAC. YOUR VOICE.</p>
+    <h1>Pick up<br>from here.</h1>
+    <p>Connect this browser to Codex Voice on your Mac, then start a conversation.</p>
     <form id="pair-form">
-      <label for="pair-code">Kopplungscode</label>
-      <input id="pair-code" type="password" autocomplete="off" autocapitalize="none" spellcheck="false" required maxlength="128">
-      <button id="pair-submit" type="submit">Mit meinem Mac verbinden <span>↗</span></button>
+      <label for="pair-code">Pairing code</label>
+      <input id="pair-code" type="password" autocomplete="off" autocapitalize="none" spellcheck="false" required maxlength="128" aria-describedby="pair-help">
+      <label class="remember-device" for="pair-remember">
+        <input id="pair-remember" type="checkbox" aria-describedby="remember-help">
+        <span>Remember this personal device for 30 days</span>
+      </label>
+      <p id="remember-help" class="field-help">Leave unchecked for a 12-hour login. Restarting the server ends either login.</p>
+      <button id="pair-submit" type="submit">Connect to my Mac <span aria-hidden="true">↗</span></button>
       <p id="pair-status" role="status" aria-live="polite"></p>
     </form>
-    <p class="footnote">Der Code aus deinem persönlichen Link ist einmal verwendbar und 30 Minuten gültig. Mikrofonzugriff kommt erst beim Start des Gesprächs.</p>
+    <details id="pair-help">
+      <summary>Need a new pairing link?</summary>
+      <p>A code expires after 30 minutes and works only once. If your login has expired or you no longer have a code, run this command in the project folder on your Mac:</p>
+      <pre><code>python3 remote.py --pair --copy</code></pre>
+      <p>Open the new link from your Mac's clipboard on this device. The command keeps the running tunnel and conversation in place.</p>
+    </details>
+    <p class="footnote">Keep pairing links private. Microphone access starts only when you start a conversation.</p>
   </main>
 </body>
 </html>
