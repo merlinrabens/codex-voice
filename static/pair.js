@@ -11,6 +11,30 @@
     status.textContent = 'No pairing code in this link. If you need to sign in again, get a new link from your Mac below.';
     document.getElementById('pair-help').open = true;
   }
+  const copyButton = document.getElementById('copy-command');
+  copyButton.addEventListener('click', async () => {
+    const command = document.getElementById('pair-command');
+    const copyStatus = document.getElementById('copy-status');
+    copyButton.disabled = true;
+    copyStatus.textContent = '';
+    try {
+      await navigator.clipboard.writeText(command.textContent);
+      copyButton.textContent = 'Copied';
+      copyStatus.textContent = 'Command copied to clipboard.';
+    } catch {
+      copyButton.textContent = 'Copy';
+      copyStatus.textContent = 'Could not copy automatically. Select and copy the command above.';
+      const selection = window.getSelection();
+      if (selection) {
+        const range = document.createRange();
+        range.selectNodeContents(command);
+        selection.removeAllRanges();
+        selection.addRange(range);
+      }
+    } finally {
+      copyButton.disabled = false;
+    }
+  });
   fetch('/api/state').then((response) => {
     if (response.ok) location.replace('/');
   }).catch(() => {});

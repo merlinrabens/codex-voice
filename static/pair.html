@@ -28,7 +28,11 @@
     <details id="pair-help">
       <summary>Need a new pairing link?</summary>
       <p>A code expires after 30 minutes and works only once. If your login has expired or you no longer have a code, run this command in the project folder on your Mac:</p>
-      <pre><code>python3 remote.py --pair --copy</code></pre>
+      <div class="command-row">
+        <pre><code id="pair-command">python3 remote.py --pair --copy</code></pre>
+        <button id="copy-command" class="copy-command" type="button" aria-label="Copy recovery command">Copy</button>
+      </div>
+      <p id="copy-status" role="status" aria-live="polite"></p>
       <p>Open the new link from your Mac's clipboard on this device. The command keeps the running tunnel and conversation in place.</p>
     </details>
     <p class="footnote">Keep pairing links private. Microphone access starts only when you start a conversation.</p>

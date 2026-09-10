@@ -16,8 +16,8 @@ function fixture({hash = '', signedIn = false, pairResponse, stateFailure = fals
   const requests = [];
   const navigation = [];
   const elements = Object.fromEntries([
-    'pair-code', 'pair-remember', 'pair-status', 'pair-help', 'pair-submit', 'pair-form'
-  ].map(id => [id, {value: '', textContent: '', disabled: false, open: false}]));
+    'pair-code', 'pair-remember', 'pair-status', 'pair-help', 'pair-submit', 'pair-form', 'copy-command'
+  ].map(id => [id, {value: '', textContent: '', disabled: false, open: false, addEventListener() {}}]));
   elements['pair-remember'].checked = /\schecked(?:\s|=|>)/.test(checkbox);
   let submit;
   elements['pair-form'].addEventListener = (event, callback) => {
